@@ -1,0 +1,13 @@
+.{
+    .paths = .{
+        "build.zig",
+        "src/grpc.zig",
+        "src/h2_connection.zig",
+        "src/main.zig",
+        "src/root.zig",
+        "src/watch.zig",
+    },
+    .rules = .{
+        .Z024 = .{ .max_length = 100 },
+    },
+}
