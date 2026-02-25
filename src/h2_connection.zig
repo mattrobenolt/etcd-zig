@@ -86,13 +86,12 @@ pub const H2Connection = struct {
 
     pub fn sendAll(self: *H2Connection) !void {
         while (true) {
-            var data_ptr: [*c]const u8 = undefined;
+            var data_ptr: ?[*]const u8 = null;
             const len = c.nghttp2_session_mem_send2(self.session, &data_ptr);
             if (len < 0) return error.Nghttp2MemSendFailed;
             if (len == 0) break;
 
-            const data: [*]const u8 = @ptrCast(data_ptr);
-            try self.stream.writeAll(data[0..@intCast(len)]);
+            try self.stream.writeAll(data_ptr.?[0..@intCast(len)]);
         }
     }
 
@@ -106,11 +105,11 @@ pub const H2Connection = struct {
 
     fn onFrameRecv(
         _: ?*c.nghttp2_session,
-        frame: [*c]const c.nghttp2_frame,
+        frame: ?*const c.nghttp2_frame,
         user_data: ?*anyopaque,
     ) callconv(.c) c_int {
         const self: *H2Connection = @ptrCast(@alignCast(user_data orelse return 0));
-        const hd = frame.*.hd;
+        const hd = (frame orelse return 0).hd;
 
         if (hd.type == @as(u8, @intCast(c.NGHTTP2_SETTINGS))) {
             if (hd.flags & @as(u8, @intCast(c.NGHTTP2_FLAG_ACK)) != 0) {
@@ -127,19 +126,21 @@ pub const H2Connection = struct {
 
     fn onHeader(
         session: ?*c.nghttp2_session,
-        frame: [*c]const c.nghttp2_frame,
-        name: [*c]const u8,
+        frame: ?*const c.nghttp2_frame,
+        name: ?[*]const u8,
         namelen: usize,
-        value: [*c]const u8,
+        value: ?[*]const u8,
         valuelen: usize,
         _: u8,
         _: ?*anyopaque,
     ) callconv(.c) c_int {
-        const stream_id = frame.*.hd.stream_id;
+        const stream_id = (frame orelse return 0).hd.stream_id;
+        const n = name orelse return 0;
+        const v = value orelse return 0;
         const stream_ud = c.nghttp2_session_get_stream_user_data(session, stream_id);
         if (stream_ud) |ud| {
             const state: *StreamState = @ptrCast(@alignCast(ud));
-            state.handleHeader(name[0..namelen], value[0..valuelen]);
+            state.handleHeader(n[0..namelen], v[0..valuelen]);
         }
         return 0;
     }
@@ -148,14 +149,15 @@ pub const H2Connection = struct {
         session: ?*c.nghttp2_session,
         _: u8,
         stream_id: i32,
-        data: [*c]const u8,
+        data: ?[*]const u8,
         len: usize,
         _: ?*anyopaque,
     ) callconv(.c) c_int {
+        const d = data orelse return 0;
         const stream_ud = c.nghttp2_session_get_stream_user_data(session, stream_id);
         if (stream_ud) |ud| {
             const state: *StreamState = @ptrCast(@alignCast(ud));
-            state.handleData(data[0..len]);
+            state.handleData(d[0..len]);
         }
         return 0;
     }

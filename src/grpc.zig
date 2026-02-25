@@ -32,13 +32,14 @@ const DataProviderCtx = struct {
     fn readCallback(
         _: ?*c.nghttp2_session,
         _: i32,
-        buf: [*c]u8,
+        buf: ?[*]u8,
         length: usize,
-        data_flags: [*c]u32,
-        source: [*c]c.nghttp2_data_source,
+        data_flags: ?*u32,
+        source: ?*c.nghttp2_data_source,
         _: ?*anyopaque,
     ) callconv(.c) c.nghttp2_ssize {
-        const ctx: *DataProviderCtx = @ptrCast(@alignCast(source.*.ptr));
+        const src = source orelse return -1;
+        const ctx: *DataProviderCtx = @ptrCast(@alignCast(src.ptr));
         const total = ctx.totalLen();
         const remaining = total - ctx.offset;
         const to_copy = @min(remaining, length);
@@ -47,7 +48,7 @@ const DataProviderCtx = struct {
         //   [0]: compressed flag (0 = not compressed)
         //   [1..5]: big-endian u32 message length
         //   [5..]: payload bytes
-        const dst = buf[0..to_copy];
+        const dst = (buf orelse return -1)[0..to_copy];
         for (dst, 0..) |*b, i| {
             const pos = ctx.offset + i;
             if (pos == 0) {
@@ -64,7 +65,7 @@ const DataProviderCtx = struct {
 
         ctx.offset += to_copy;
         if (ctx.offset >= total) {
-            data_flags.* |= @as(u32, @intCast(c.NGHTTP2_DATA_FLAG_EOF));
+            (data_flags orelse return -1).* |= @as(u32, @intCast(c.NGHTTP2_DATA_FLAG_EOF));
         }
         return @intCast(to_copy);
     }
