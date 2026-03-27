@@ -1,7 +1,7 @@
 {
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-parts.url = "github:hercules-ci/flake-parts";
     mattware = {
       url = "github:mattrobenolt/nixpkgs";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -9,36 +9,34 @@
   };
 
   outputs =
-    {
-      nixpkgs,
-      flake-utils,
-      mattware,
-      ...
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ mattware.overlays.default ];
-        };
-      in
-      {
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            etcd
-            just
-            protobuf
-            zig_0_15
-            zls_0_15
-            ziglint
-            zigdoc
-          ];
+    inputs@{ flake-parts, mattware, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
 
-          shellHook = ''
-            unset NIX_CFLAGS_COMPILE
-          '';
+      perSystem =
+        { system, ... }:
+        let
+          pkgs = inputs.nixpkgs.legacyPackages.${system}.extend mattware.overlays.default;
+        in
+        {
+          devShells.default = pkgs.mkShell {
+            packages = with pkgs; [
+              etcd
+              protobuf
+              zig_0_15
+              zls_0_15
+              ziglint
+              zigdoc
+            ];
+
+            shellHook = ''
+              unset NIX_CFLAGS_COMPILE
+            '';
+          };
         };
-      }
-    );
+    };
 }
