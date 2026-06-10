@@ -653,13 +653,17 @@ pub const WatchCreateRequest = struct {
     key: []const u8 = &.{},
     range_end: []const u8 = &.{},
     start_revision: i64 = 0,
+    progress_notify: bool = false,
     prev_kv: bool = false,
+    watch_id: i64 = 0,
 
     pub const _desc_table = .{
         .key = fd(1, .{ .scalar = .bytes }),
         .range_end = fd(2, .{ .scalar = .bytes }),
         .start_revision = fd(3, .{ .scalar = .int64 }),
+        .progress_notify = fd(4, .{ .scalar = .bool }),
         .prev_kv = fd(6, .{ .scalar = .bool }),
+        .watch_id = fd(7, .{ .scalar = .int64 }),
     };
 
     /// Encodes the message to the writer
@@ -732,6 +736,8 @@ pub const WatchResponse = struct {
     created: bool = false,
     canceled: bool = false,
     compact_revision: i64 = 0,
+    cancel_reason: []const u8 = &.{},
+    fragment: bool = false,
     events: std.ArrayListUnmanaged(mvccpb.Event) = .empty,
 
     pub const _desc_table = .{
@@ -740,6 +746,8 @@ pub const WatchResponse = struct {
         .created = fd(3, .{ .scalar = .bool }),
         .canceled = fd(4, .{ .scalar = .bool }),
         .compact_revision = fd(5, .{ .scalar = .int64 }),
+        .cancel_reason = fd(6, .{ .scalar = .string }),
+        .fragment = fd(7, .{ .scalar = .bool }),
         .events = fd(11, .{ .repeated = .submessage}),
     };
 
