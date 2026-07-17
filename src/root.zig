@@ -16,3 +16,7 @@ test "nghttp2 linked" {
     const std = @import("std");
     try std.testing.expect(info != null);
 }
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

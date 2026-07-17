@@ -1,11 +1,86 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const testing = std.testing;
 
 const c = @import("root.zig").c;
 const H2Connection = @import("h2_connection.zig").H2Connection;
 const StreamState = @import("h2_connection.zig").StreamState;
 
 const log = std.log.scoped(.grpc);
+
+/// One extra request header to attach to a gRPC call. Names must already be
+/// lowercase (an HTTP/2 requirement, enforced when the request is built).
+/// `sensitive` headers are flagged NGHTTP2_NV_FLAG_NO_INDEX so secret values
+/// (e.g. `authorization`) never enter the HPACK dynamic table; nghttp2's
+/// normal copy behavior stays enabled, so the caller may wipe the value
+/// buffer once the request has been submitted and flushed.
+pub const RequestHeader = struct {
+    name: []const u8,
+    value: []const u8,
+    sensitive: bool = false,
+};
+
+/// Per-request options shared by unary and server-streaming calls.
+pub const RequestOptions = struct {
+    headers: []const RequestHeader = &.{},
+};
+
+/// Fixed upper bound on extra headers per request. Headers live in a stack
+/// array so request construction never allocates; excess headers are
+/// rejected rather than grown.
+pub const max_extra_headers = 4;
+
+const base_header_count = 6;
+
+pub const HeaderError = error{ TooManyRequestHeaders, InvalidHeaderName };
+
+/// The six fixed gRPC headers plus bounded extras. The nv entries point into
+/// caller-owned memory; nghttp2 copies names and values at submit time (no
+/// NO_COPY flags), so the pointed-to bytes only need to outlive
+/// nghttp2_submit_request2.
+const Headers = struct {
+    nva: [base_header_count + max_extra_headers]c.nghttp2_nv,
+    len: usize,
+};
+
+/// Single construction site for request headers: both the unary and the
+/// server-streaming builders go through here, so extra-header semantics
+/// (bounds, name validation, NO_INDEX) cannot diverge between them.
+fn buildHeaders(path: []const u8, options: RequestOptions) HeaderError!Headers {
+    if (options.headers.len > max_extra_headers) return error.TooManyRequestHeaders;
+
+    var headers: Headers = .{
+        .nva = undefined,
+        .len = base_header_count + options.headers.len,
+    };
+    headers.nva[0..base_header_count].* = .{
+        makeNv(":method", "POST", .none),
+        makeNv(":scheme", "http", .none),
+        makeNv(":authority", "localhost", .none),
+        makeNv(":path", path, .none),
+        makeNv("content-type", "application/grpc+proto", .none),
+        makeNv("te", "trailers", .none),
+    };
+    for (options.headers, base_header_count..) |header, i| {
+        if (!validHeaderName(header.name)) return error.InvalidHeaderName;
+        headers.nva[i] = makeNv(
+            header.name,
+            header.value,
+            if (header.sensitive) .no_index else .none,
+        );
+    }
+    return headers;
+}
+
+/// HTTP/2 requires lowercase field names; uppercase would poison the whole
+/// connection with a protocol error rather than just this request.
+fn validHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |b| {
+        if (std.ascii.isUpper(b)) return false;
+    }
+    return true;
+}
 
 pub const GrpcResponse = struct {
     http_status: u32,
@@ -78,17 +153,20 @@ pub fn unaryCall(
     path: []const u8,
     request_bytes: []const u8,
 ) !GrpcResponse {
+    return unaryCallWithOptions(gpa, conn, path, request_bytes, .{});
+}
+
+/// `unaryCall` with extra request headers.
+pub fn unaryCallWithOptions(
+    gpa: Allocator,
+    conn: *H2Connection,
+    path: []const u8,
+    request_bytes: []const u8,
+    options: RequestOptions,
+) !GrpcResponse {
     log.debug("calling {s}", .{path});
 
-    // Build gRPC request headers.
-    var nva = [_]c.nghttp2_nv{
-        makeNv(":method", "POST"),
-        makeNv(":scheme", "http"),
-        makeNv(":authority", "localhost"),
-        makeNv(":path", path),
-        makeNv("content-type", "application/grpc+proto"),
-        makeNv("te", "trailers"),
-    };
+    var headers = try buildHeaders(path, options);
 
     // Set up the data provider for the request body.
     var provider_ctx: DataProviderCtx = .{ .payload = request_bytes };
@@ -104,8 +182,8 @@ pub fn unaryCall(
     const stream_id = c.nghttp2_submit_request2(
         conn.session,
         null, // priority (ignored)
-        &nva,
-        nva.len,
+        &headers.nva,
+        headers.len,
         &data_provider,
         @ptrCast(&stream_state), // stream_user_data
     );
@@ -214,6 +292,17 @@ pub fn openServerStream(
     path: []const u8,
     request_bytes: []const u8,
 ) !GrpcStreamReader {
+    return openServerStreamWithOptions(allocator, conn, path, request_bytes, .{});
+}
+
+/// `openServerStream` with extra request headers.
+pub fn openServerStreamWithOptions(
+    allocator: Allocator,
+    conn: *H2Connection,
+    path: []const u8,
+    request_bytes: []const u8,
+    options: RequestOptions,
+) !GrpcStreamReader {
     log.debug("opening stream {s}", .{path});
 
     var reader: GrpcStreamReader = .{
@@ -222,14 +311,7 @@ pub fn openServerStream(
     };
     errdefer reader.deinit();
 
-    var nva = [_]c.nghttp2_nv{
-        makeNv(":method", "POST"),
-        makeNv(":scheme", "http"),
-        makeNv(":authority", "localhost"),
-        makeNv(":path", path),
-        makeNv("content-type", "application/grpc+proto"),
-        makeNv("te", "trailers"),
-    };
+    var headers = try buildHeaders(path, options);
 
     var provider_ctx: DataProviderCtx = .{ .payload = request_bytes };
     var data_provider: c.nghttp2_data_provider2 = .{
@@ -240,8 +322,8 @@ pub fn openServerStream(
     const stream_id = c.nghttp2_submit_request2(
         conn.session,
         null,
-        &nva,
-        nva.len,
+        &headers.nva,
+        headers.len,
         &data_provider,
         null, // set properly via activate() after return-by-value
     );
@@ -252,12 +334,125 @@ pub fn openServerStream(
     return reader;
 }
 
-fn makeNv(name: []const u8, value: []const u8) c.nghttp2_nv {
+const NvFlag = enum { none, no_index };
+
+fn makeNv(name: []const u8, value: []const u8, flag: NvFlag) c.nghttp2_nv {
     return .{
         .name = @constCast(name.ptr),
         .value = @constCast(value.ptr),
         .namelen = name.len,
         .valuelen = value.len,
-        .flags = @intCast(c.NGHTTP2_NV_FLAG_NONE),
+        .flags = @intCast(switch (flag) {
+            .none => c.NGHTTP2_NV_FLAG_NONE,
+            .no_index => c.NGHTTP2_NV_FLAG_NO_INDEX,
+        }),
     };
+}
+
+// -- Tests -----------------------------------------------------------------------------
+
+fn expectNv(
+    nv: c.nghttp2_nv,
+    name: []const u8,
+    value: []const u8,
+    no_index: bool,
+) !void {
+    try testing.expectEqualStrings(name, nv.name[0..nv.namelen]);
+    try testing.expectEqualStrings(value, nv.value[0..nv.valuelen]);
+    const no_index_flag: u8 = @intCast(c.NGHTTP2_NV_FLAG_NO_INDEX);
+    try testing.expectEqual(no_index, nv.flags & no_index_flag != 0);
+    // Copy behavior stays enabled: with NO_COPY unset, nghttp2 duplicates the
+    // name/value at submit time, so callers may wipe secret buffers after the
+    // request is flushed.
+    const no_copy: u8 = @intCast(c.NGHTTP2_NV_FLAG_NO_COPY_NAME | c.NGHTTP2_NV_FLAG_NO_COPY_VALUE);
+    try testing.expectEqual(0, nv.flags & no_copy);
+}
+
+test "buildHeaders: empty options preserve the existing header set" {
+    const headers = try buildHeaders("/etcdserverpb.KV/Range", .{});
+    try testing.expectEqual(base_header_count, headers.len);
+    try expectNv(headers.nva[0], ":method", "POST", false);
+    try expectNv(headers.nva[1], ":scheme", "http", false);
+    try expectNv(headers.nva[2], ":authority", "localhost", false);
+    try expectNv(headers.nva[3], ":path", "/etcdserverpb.KV/Range", false);
+    try expectNv(headers.nva[4], "content-type", "application/grpc+proto", false);
+    try expectNv(headers.nva[5], "te", "trailers", false);
+}
+
+test "buildHeaders: extra header appears with exact name and value" {
+    const headers = try buildHeaders("/p", .{ .headers = &.{
+        .{ .name = "x-custom", .value = "v1" },
+    } });
+    try testing.expectEqual(base_header_count + 1, headers.len);
+    try expectNv(headers.nva[base_header_count], "x-custom", "v1", false);
+}
+
+test "buildHeaders: sensitive authorization header carries NO_INDEX" {
+    const headers = try buildHeaders("/p", .{ .headers = &.{
+        .{ .name = "authorization", .value = "Basic YWxpY2U6Zmlyc3Q=", .sensitive = true },
+    } });
+    try expectNv(
+        headers.nva[base_header_count],
+        "authorization",
+        "Basic YWxpY2U6Zmlyc3Q=",
+        true,
+    );
+}
+
+test "buildHeaders: header-count guard rejects overflow" {
+    const extra: RequestHeader = .{ .name = "x-h", .value = "v" };
+    const too_many = [_]RequestHeader{extra} ** (max_extra_headers + 1);
+    try testing.expectError(
+        error.TooManyRequestHeaders,
+        buildHeaders("/p", .{ .headers = &too_many }),
+    );
+    // Exactly max_extra_headers is still accepted.
+    const headers = try buildHeaders("/p", .{ .headers = too_many[0..max_extra_headers] });
+    try testing.expectEqual(base_header_count + max_extra_headers, headers.len);
+}
+
+test "buildHeaders: rejects non-lowercase and empty header names" {
+    try testing.expectError(error.InvalidHeaderName, buildHeaders("/p", .{ .headers = &.{
+        .{ .name = "Authorization", .value = "v" },
+    } }));
+    try testing.expectError(error.InvalidHeaderName, buildHeaders("/p", .{ .headers = &.{
+        .{ .name = "", .value = "v" },
+    } }));
+}
+
+test "unary and streaming entry points share the options path" {
+    // Compile-time signature guard: both *WithOptions entry points take the
+    // same RequestOptions, and the legacy wrappers remain source-compatible.
+    // buildHeaders is the only header-construction site, so pinning the
+    // signatures pins both request builders to one options path.
+    const unary: *const fn (
+        Allocator,
+        *H2Connection,
+        []const u8,
+        []const u8,
+        RequestOptions,
+    ) anyerror!GrpcResponse = &unaryCallWithOptions;
+    _ = unary;
+    const streaming: *const fn (
+        Allocator,
+        *H2Connection,
+        []const u8,
+        []const u8,
+        RequestOptions,
+    ) anyerror!GrpcStreamReader = &openServerStreamWithOptions;
+    _ = streaming;
+    const legacy_unary: *const fn (
+        Allocator,
+        *H2Connection,
+        []const u8,
+        []const u8,
+    ) anyerror!GrpcResponse = &unaryCall;
+    _ = legacy_unary;
+    const legacy_streaming: *const fn (
+        Allocator,
+        *H2Connection,
+        []const u8,
+        []const u8,
+    ) anyerror!GrpcStreamReader = &openServerStream;
+    _ = legacy_streaming;
 }
