@@ -12,7 +12,7 @@ const etcdserverpb = @import("proto/etcdserverpb.pb.zig");
 const log = std.log.scoped(.watch);
 
 /// The result of computing a prefix end bound.
-const PrefixEnd = union(enum) {
+pub const PrefixEnd = union(enum) {
     /// An allocated upper bound. Caller must free with the same allocator.
     owned: []u8,
     /// The prefix is all 0xFF — range covers everything from prefix onward.
