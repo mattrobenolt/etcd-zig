@@ -89,7 +89,9 @@ message WatchCreateRequest {
   bytes key = 1;
   bytes range_end = 2;
   int64 start_revision = 3;
+  bool progress_notify = 4;
   bool prev_kv = 6;
+  int64 watch_id = 7;
 }
 
 message WatchResponse {
@@ -98,9 +100,25 @@ message WatchResponse {
   bool created = 3;
   bool canceled = 4;
   int64 compact_revision = 5;
+  string cancel_reason = 6;
+  bool fragment = 7;
   repeated mvccpb.Event events = 11;
 }
 
 service Watch {
   rpc Watch(stream WatchRequest) returns (stream WatchResponse);
+}
+
+message AuthenticateRequest {
+  string name = 1;
+  string password = 2;
+}
+
+message AuthenticateResponse {
+  ResponseHeader header = 1;
+  string token = 2;
+}
+
+service Auth {
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
 }

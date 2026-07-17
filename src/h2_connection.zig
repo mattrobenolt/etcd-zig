@@ -194,6 +194,7 @@ pub const StreamState = struct {
     }
 
     pub fn deinit(self: *StreamState) void {
+        if (self.grpc_message) |message| self.allocator.free(message);
         self.data.deinit(self.allocator);
         self.* = undefined;
     }
@@ -209,7 +210,10 @@ pub const StreamState = struct {
         } else if (mem.eql(u8, name, "grpc-status")) {
             self.grpc_status = std.fmt.parseInt(u32, value, 10) catch null;
         } else if (mem.eql(u8, name, "grpc-message")) {
-            self.grpc_message = value;
+            // Dupe: `value` points into nghttp2-owned memory that is invalid
+            // once the header callback returns.
+            if (self.grpc_message) |old| self.allocator.free(old);
+            self.grpc_message = self.allocator.dupe(u8, value) catch null;
         }
     }
 

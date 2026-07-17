@@ -85,11 +85,13 @@ fn validHeaderName(name: []const u8) bool {
 pub const GrpcResponse = struct {
     http_status: u32,
     grpc_status: u32,
+    /// grpc-message trailer, if any. Owned by caller.
     grpc_message: ?[]const u8,
     /// Raw protobuf response bytes (gRPC length-prefix stripped). Owned by caller.
     data: []const u8,
 
     pub fn deinit(self: GrpcResponse, gpa: Allocator) void {
+        if (self.grpc_message) |message| gpa.free(message);
         gpa.free(self.data);
     }
 };
@@ -206,11 +208,16 @@ pub fn unaryCallWithOptions(
     const raw = stream_state.data.items;
     const payload_src = if (raw.len > 5) raw[5..] else raw[0..0];
     const payload = try gpa.dupe(u8, payload_src);
+    errdefer gpa.free(payload);
+
+    // The stream state (and its trailer copy) dies with this call; the
+    // response owns its own copy.
+    const message = if (stream_state.grpc_message) |m| try gpa.dupe(u8, m) else null;
 
     return .{
         .http_status = http_status,
         .grpc_status = grpc_status,
-        .grpc_message = stream_state.grpc_message,
+        .grpc_message = message,
         .data = payload,
     };
 }
@@ -366,6 +373,25 @@ fn expectNv(
     // request is flushed.
     const no_copy: u8 = @intCast(c.NGHTTP2_NV_FLAG_NO_COPY_NAME | c.NGHTTP2_NV_FLAG_NO_COPY_VALUE);
     try testing.expectEqual(0, nv.flags & no_copy);
+}
+
+test "StreamState owns its grpc-message copy" {
+    // The header callback hands us a slice into nghttp2-owned memory that is
+    // invalid after the callback returns; StreamState must keep its own copy
+    // (auth classification reads it after the transport has moved on).
+    var state: StreamState = .init(testing.allocator);
+    defer state.deinit();
+
+    var transient = "etcdserver: invalid auth token".*;
+    state.handleHeader("grpc-message", &transient);
+    @memset(&transient, 'x');
+    try testing.expectEqualStrings("etcdserver: invalid auth token", state.grpc_message.?);
+
+    // A repeated trailer replaces the copy without leaking (leak-checked by
+    // testing.allocator).
+    var second = "etcdserver: user name is empty".*;
+    state.handleHeader("grpc-message", &second);
+    try testing.expectEqualStrings("etcdserver: user name is empty", state.grpc_message.?);
 }
 
 test "buildHeaders: empty options preserve the existing header set" {
