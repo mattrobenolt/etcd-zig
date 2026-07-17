@@ -108,3 +108,17 @@ message WatchResponse {
 service Watch {
   rpc Watch(stream WatchRequest) returns (stream WatchResponse);
 }
+
+message AuthenticateRequest {
+  string name = 1;
+  string password = 2;
+}
+
+message AuthenticateResponse {
+  ResponseHeader header = 1;
+  string token = 2;
+}
+
+service Auth {
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+}

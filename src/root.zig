@@ -1,3 +1,4 @@
+pub const auth = @import("auth.zig");
 pub const grpc = @import("grpc.zig");
 pub const H2Connection = @import("h2_connection.zig").H2Connection;
 pub const etcdserverpb = @import("proto/etcdserverpb.pb.zig");
