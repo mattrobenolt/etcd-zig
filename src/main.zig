@@ -8,16 +8,20 @@ const mvccpb = etcd.mvccpb;
 
 const log = std.log.scoped(.main);
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    var threaded: Io.Threaded = .init(allocator, .{ .environ = init.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // -- One-time setup: Put + Range to establish a baseline revision --
 
     var last_revision: i64 = 0;
     {
-        var conn: etcd.H2Connection = try .connect(allocator, "localhost", 2379);
+        var conn: etcd.H2Connection = try .connect(allocator, io, "localhost", 2379);
         defer conn.deinit();
         try conn.performHandshake();
 
@@ -78,7 +82,7 @@ pub fn main() !void {
 
     // -- Watch using WatchIterator --
 
-    var iter: etcd.WatchIterator = .init(allocator, "localhost", 2379, .{
+    var iter: etcd.WatchIterator = .init(allocator, io, "localhost", 2379, .{
         .target = .all,
         .start_revision = last_revision,
     });
