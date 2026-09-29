@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var last_revision: i64 = 0;
     {
-        var conn: etcd.H2Connection = try .connect(allocator, io, "localhost", 2379);
+        var conn: etcd.H2Connection = try .connect(io, "localhost", 2379);
         defer conn.deinit();
         try conn.performHandshake();
 

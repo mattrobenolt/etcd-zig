@@ -13,8 +13,8 @@ pub const H2Connection = struct {
     settings_received: bool,
     settings_ack_received: bool,
 
-    pub fn connect(gpa: Allocator, io: std.Io, host: []const u8, port: u16) !H2Connection {
-        const tcp_stream = try connectTcp(gpa, io, host, port);
+    pub fn connect(io: std.Io, host: []const u8, port: u16) !H2Connection {
+        const tcp_stream = try connectTcp(io, host, port);
         errdefer tcp_stream.close(io);
 
         var callbacks: ?*c.nghttp2_session_callbacks = null;
@@ -194,56 +194,17 @@ pub const H2Connection = struct {
     }
 };
 
-/// Connect to a host:port, resolving via DNS when needed. 0.16's
-/// std.Io.net has no DNS resolver (IpAddress.parse is literal-only), so
-/// hostnames go through libc getaddrinfo — the same thing 0.15's
-/// tcpConnectToHost did under the hood. Each resolved address is tried in
-/// order until one connects.
-fn connectTcp(gpa: Allocator, io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+/// Connect to a host:port, resolving via DNS when needed. Literal IPs skip
+/// the resolver; hostnames go through `std.Io.net.HostName.connect`, which
+/// resolves and dials the answered addresses until one connects.
+fn connectTcp(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
     // Fast path: literal IP, no DNS.
     if (std.Io.net.IpAddress.parse(host, port)) |addr| {
         return addr.connect(io, .{ .mode = .stream });
     } else |_| {}
 
-    const host_z = try gpa.dupeZ(u8, host);
-    defer gpa.free(host_z);
-
-    var list: ?*std.c.addrinfo = null;
-    // std.c declares the return as the EAI enum; 0 (success) is deliberately
-    // not a member, so compare through the integer.
-    const rc = std.c.getaddrinfo(host_z, null, null, &list);
-    if (@intFromEnum(rc) != 0) return error.NameResolutionFailed;
-    defer std.c.freeaddrinfo(list.?);
-
-    var last_err: ?anyerror = null;
-    var it = list;
-    while (it) |ai| : (it = ai.next) {
-        const sa = ai.addr orelse continue;
-        const addr: std.Io.net.IpAddress = switch (ai.family) {
-            std.posix.AF.INET => blk: {
-                const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
-                break :blk .{ .ip4 = .{
-                    .bytes = @bitCast(in.addr),
-                    .port = port,
-                } };
-            },
-            std.posix.AF.INET6 => blk: {
-                const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(sa));
-                break :blk .{ .ip6 = .{
-                    .port = port,
-                    .bytes = in6.addr,
-                    .flow = in6.flowinfo,
-                    .interface = .none,
-                } };
-            },
-            else => continue,
-        };
-        return addr.connect(io, .{ .mode = .stream }) catch |err| {
-            last_err = err;
-            continue;
-        };
-    }
-    return last_err orelse error.NameResolutionFailed;
+    const host_name: std.Io.net.HostName = try .init(host);
+    return host_name.connect(io, port, .{ .mode = .stream });
 }
 
 /// Per-stream state used by gRPC to accumulate response data.

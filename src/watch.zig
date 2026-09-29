@@ -209,7 +209,7 @@ pub const WatchIterator = struct {
         assert(self.stream == null);
 
         // Connect and handshake.
-        var conn: H2Connection = try .connect(self.gpa, self.io, self.host, self.port);
+        var conn: H2Connection = try .connect(self.io, self.host, self.port);
         errdefer conn.deinit();
         try conn.performHandshake();
 
