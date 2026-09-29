@@ -267,9 +267,9 @@ pub const GrpcStreamReader = struct {
 
     fn readOnce(self: *GrpcStreamReader) !void {
         var buf: [16384]u8 = undefined;
-        const n = try self.conn.stream.read(&buf);
-        if (n == 0) return error.ConnectionClosed;
-        const consumed = c.nghttp2_session_mem_recv2(self.conn.session, &buf, n);
+        const data = try self.conn.recvOnce(&buf);
+        if (data.len == 0) return error.ConnectionClosed;
+        const consumed = c.nghttp2_session_mem_recv2(self.conn.session, data.ptr, data.len);
         if (consumed < 0) return error.Nghttp2MemRecvFailed;
         try self.conn.sendAll();
     }

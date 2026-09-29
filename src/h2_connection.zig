@@ -7,14 +7,15 @@ const c = @import("root.zig").c;
 const log = std.log.scoped(.h2);
 
 pub const H2Connection = struct {
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
+    io: std.Io,
     session: *c.nghttp2_session,
     settings_received: bool,
     settings_ack_received: bool,
 
-    pub fn connect(gpa: Allocator, host: []const u8, port: u16) !H2Connection {
-        const tcp_stream = try std.net.tcpConnectToHost(gpa, host, port);
-        errdefer tcp_stream.close();
+    pub fn connect(gpa: Allocator, io: std.Io, host: []const u8, port: u16) !H2Connection {
+        const tcp_stream = try connectTcp(gpa, io, host, port);
+        errdefer tcp_stream.close(io);
 
         var callbacks: ?*c.nghttp2_session_callbacks = null;
         if (c.nghttp2_session_callbacks_new(&callbacks) != 0)
@@ -28,6 +29,7 @@ pub const H2Connection = struct {
 
         var conn: H2Connection = .{
             .stream = tcp_stream,
+            .io = io,
             .session = undefined,
             .settings_received = false,
             .settings_ack_received = false,
@@ -54,10 +56,10 @@ pub const H2Connection = struct {
 
         var buf: [16384]u8 = undefined;
         while (!self.settings_received or !self.settings_ack_received) {
-            const n = try self.stream.read(&buf);
-            if (n == 0) return error.ConnectionClosed;
+            const data = try self.recvOnce(&buf);
+            if (data.len == 0) return error.ConnectionClosed;
 
-            const consumed = c.nghttp2_session_mem_recv2(self.session, &buf, n);
+            const consumed = c.nghttp2_session_mem_recv2(self.session, data.ptr, data.len);
             if (consumed < 0) return error.Nghttp2MemRecvFailed;
 
             try self.sendAll();
@@ -74,30 +76,45 @@ pub const H2Connection = struct {
     ) !void {
         var buf: [16384]u8 = undefined;
         while (!done(ctx)) {
-            const n = try self.stream.read(&buf);
-            if (n == 0) return error.ConnectionClosed;
+            const data = try self.recvOnce(&buf);
+            if (data.len == 0) return error.ConnectionClosed;
 
-            const consumed = c.nghttp2_session_mem_recv2(self.session, &buf, n);
+            const consumed = c.nghttp2_session_mem_recv2(self.session, data.ptr, data.len);
             if (consumed < 0) return error.Nghttp2MemRecvFailed;
 
             try self.sendAll();
         }
     }
 
+    /// Blocking read of whatever bytes are available into `buf`. 0.16's
+    /// std.Io.net.Stream has no direct read/write; the unbuffered-reader
+    /// dance below is the `read()` equivalent.
+    pub fn recvOnce(self: *H2Connection, buf: []u8) ![]const u8 {
+        var reader = self.stream.reader(self.io, buf);
+        reader.interface.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return &.{},
+            else => return err,
+        };
+        return reader.interface.buffered();
+    }
+
     pub fn sendAll(self: *H2Connection) !void {
+        var wbuf: [16384]u8 = undefined;
+        var writer = self.stream.writer(self.io, &wbuf);
         while (true) {
             var data_ptr: ?[*]const u8 = null;
             const len = c.nghttp2_session_mem_send2(self.session, &data_ptr);
             if (len < 0) return error.Nghttp2MemSendFailed;
             if (len == 0) break;
 
-            try self.stream.writeAll(data_ptr.?[0..@intCast(len)]);
+            try writer.interface.writeAll(data_ptr.?[0..@intCast(len)]);
         }
+        try writer.interface.flush();
     }
 
     pub fn deinit(self: *H2Connection) void {
         c.nghttp2_session_del(self.session);
-        self.stream.close();
+        self.stream.close(self.io);
         self.* = undefined;
     }
 
@@ -176,6 +193,58 @@ pub const H2Connection = struct {
         return 0;
     }
 };
+
+/// Connect to a host:port, resolving via DNS when needed. 0.16's
+/// std.Io.net has no DNS resolver (IpAddress.parse is literal-only), so
+/// hostnames go through libc getaddrinfo — the same thing 0.15's
+/// tcpConnectToHost did under the hood. Each resolved address is tried in
+/// order until one connects.
+fn connectTcp(gpa: Allocator, io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    // Fast path: literal IP, no DNS.
+    if (std.Io.net.IpAddress.parse(host, port)) |addr| {
+        return addr.connect(io, .{ .mode = .stream });
+    } else |_| {}
+
+    const host_z = try gpa.dupeZ(u8, host);
+    defer gpa.free(host_z);
+
+    var list: ?*std.c.addrinfo = null;
+    // std.c declares the return as the EAI enum; 0 (success) is deliberately
+    // not a member, so compare through the integer.
+    const rc = std.c.getaddrinfo(host_z, null, null, &list);
+    if (@intFromEnum(rc) != 0) return error.NameResolutionFailed;
+    defer std.c.freeaddrinfo(list.?);
+
+    var last_err: ?anyerror = null;
+    var it = list;
+    while (it) |ai| : (it = ai.next) {
+        const sa = ai.addr orelse continue;
+        const addr: std.Io.net.IpAddress = switch (ai.family) {
+            std.posix.AF.INET => blk: {
+                const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
+                break :blk .{ .ip4 = .{
+                    .bytes = @bitCast(in.addr),
+                    .port = port,
+                } };
+            },
+            std.posix.AF.INET6 => blk: {
+                const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(sa));
+                break :blk .{ .ip6 = .{
+                    .port = port,
+                    .bytes = in6.addr,
+                    .flow = in6.flowinfo,
+                    .interface = .none,
+                } };
+            },
+            else => continue,
+        };
+        return addr.connect(io, .{ .mode = .stream }) catch |err| {
+            last_err = err;
+            continue;
+        };
+    }
+    return last_err orelse error.NameResolutionFailed;
+}
 
 /// Per-stream state used by gRPC to accumulate response data.
 pub const StreamState = struct {

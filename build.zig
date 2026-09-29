@@ -16,8 +16,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    nghttp2.addIncludePath(nghttp2_dep.path("lib/includes"));
-    nghttp2.addIncludePath(nghttp2_dep.path("lib"));
+    nghttp2.root_module.addIncludePath(nghttp2_dep.path("lib/includes"));
+    nghttp2.root_module.addIncludePath(nghttp2_dep.path("lib"));
 
     const nghttp2_sources: []const []const u8 = &.{
         "nghttp2_alpn.c",
@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     };
     const no_flags: []const []const u8 = &.{};
 
-    nghttp2.addCSourceFiles(.{
+    nghttp2.root_module.addCSourceFiles(.{
         .root = nghttp2_dep.path("lib"),
         .files = nghttp2_sources,
         .flags = if (target.result.os.tag != .windows) non_windows_flags else no_flags,

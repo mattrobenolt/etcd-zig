@@ -1,3 +1,6 @@
 zig-out/
 .zig-cache/
 default.etcd/
+
+# Zig 0.16 project-local package fetch dir
+zig-pkg/

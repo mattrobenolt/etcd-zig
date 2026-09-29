@@ -2,7 +2,6 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const sleep = std.Thread.sleep;
 const testing = std.testing;
 
 const grpc = @import("grpc.zig");
@@ -95,6 +94,7 @@ pub const KeyRange = union(enum) {
 pub const WatchIterator = struct {
     // Config (immutable after init)
     gpa: Allocator,
+    io: Io,
     host: []const u8,
     port: u16,
     target: KeyRange,
@@ -111,9 +111,10 @@ pub const WatchIterator = struct {
         prev_kv: bool = false,
     };
 
-    pub fn init(gpa: Allocator, host: []const u8, port: u16, opts: Options) WatchIterator {
+    pub fn init(gpa: Allocator, io: Io, host: []const u8, port: u16, opts: Options) WatchIterator {
         return .{
             .gpa = gpa,
+            .io = io,
             .host = host,
             .port = port,
             .target = opts.target,
@@ -141,7 +142,7 @@ pub const WatchIterator = struct {
                 self.establish() catch |err| {
                     log.warn("establish failed: {s}, retrying in 1s...", .{@errorName(err)});
                     self.teardown();
-                    sleep(1 * std.time.ns_per_s);
+                    Io.sleep(self.io, .fromNanoseconds(std.time.ns_per_s), .awake) catch {};
                     continue;
                 };
             }
@@ -150,7 +151,7 @@ pub const WatchIterator = struct {
             const msg_bytes = self.stream.?.next(self.gpa) catch |err| {
                 log.warn("stream read error: {s}, reconnecting...", .{@errorName(err)});
                 self.teardown();
-                sleep(1 * std.time.ns_per_s);
+                Io.sleep(self.io, .fromNanoseconds(std.time.ns_per_s), .awake) catch {};
                 continue;
             };
 
@@ -184,7 +185,7 @@ pub const WatchIterator = struct {
                 // stream.next() returned null => stream closed by server.
                 log.warn("stream closed, reconnecting...", .{});
                 self.teardown();
-                sleep(1 * std.time.ns_per_s);
+                Io.sleep(self.io, .fromNanoseconds(std.time.ns_per_s), .awake) catch {};
                 continue;
             }
         }
@@ -208,7 +209,7 @@ pub const WatchIterator = struct {
         assert(self.stream == null);
 
         // Connect and handshake.
-        var conn: H2Connection = try .connect(self.gpa, self.host, self.port);
+        var conn: H2Connection = try .connect(self.gpa, self.io, self.host, self.port);
         errdefer conn.deinit();
         try conn.performHandshake();
 
