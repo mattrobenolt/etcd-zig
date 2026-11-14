@@ -1,122 +1,89 @@
+//! A small demo: write, read, watch an event, delete, and cancel the watch.
+//!
+//! `zig build run -- 127.0.0.1:2379`. The endpoint defaults to the same.
+
 const std = @import("std");
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
+const print = std.debug.print;
 
 const etcd = @import("etcd");
-const etcdserverpb = etcd.etcdserverpb;
-const mvccpb = etcd.mvccpb;
 
-const log = std.log.scoped(.main);
+const default_endpoint = "127.0.0.1:2379";
+const prefix = "etcd-zig-demo/";
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    const endpoint = if (args.len > 1) args[1] else default_endpoint;
 
-    var threaded: Io.Threaded = .init(allocator, .{ .environ = init.environ });
-    defer threaded.deinit();
-    const io = threaded.io();
+    var client: etcd.Client = undefined;
+    try client.init(init.gpa, io, endpoint, .{});
+    defer client.deinit();
 
-    // -- One-time setup: Put + Range to establish a baseline revision --
-
-    var last_revision: i64 = 0;
-    {
-        var conn: etcd.H2Connection = try .connect(io, "localhost", 2379);
-        defer conn.deinit();
-        try conn.performHandshake();
-
-        // Put key="hello" value="world"
-        {
-            const req_bytes = try encodePb(etcdserverpb.PutRequest, allocator, .{
-                .key = "hello",
-                .value = "world",
-            });
-            defer allocator.free(req_bytes);
-
-            const response = try etcd.grpc.unaryCall(
-                allocator,
-                &conn,
-                "/etcdserverpb.KV/Put",
-                req_bytes,
-            );
-            defer response.deinit(allocator);
-
-            if (response.grpc_status == 0 and response.data.len > 0) {
-                var reader: Io.Reader = .fixed(response.data);
-                var put_resp: etcdserverpb.PutResponse = try .decode(&reader, allocator);
-                defer put_resp.deinit(allocator);
-
-                if (put_resp.header) |hdr| {
-                    last_revision = hdr.revision;
-                    log.info("put: revision={d}", .{hdr.revision});
-                }
-            }
-        }
-
-        // Range to confirm
-        {
-            const req_bytes = try encodePb(etcdserverpb.RangeRequest, allocator, .{
-                .key = "hello",
-            });
-            defer allocator.free(req_bytes);
-
-            const response = try etcd.grpc.unaryCall(
-                allocator,
-                &conn,
-                "/etcdserverpb.KV/Range",
-                req_bytes,
-            );
-            defer response.deinit(allocator);
-
-            if (response.grpc_status == 0 and response.data.len > 0) {
-                var reader: Io.Reader = .fixed(response.data);
-                var range_resp: etcdserverpb.RangeResponse = try .decode(&reader, allocator);
-                defer range_resp.deinit(allocator);
-
-                for (range_resp.kvs.items) |kv| {
-                    log.info("range: key={s} value={s}", .{ kv.key, kv.value });
-                }
-            }
-        }
-    }
-
-    // -- Watch using WatchIterator --
-
-    var iter: etcd.WatchIterator = .init(allocator, io, "localhost", 2379, .{
-        .target = .all,
-        .start_revision = last_revision,
+    var put = try client.put(.{ .key = prefix ++ "greeting", .value = "hello" }, .{});
+    defer put.deinit();
+    const put_value = try put.tryValue();
+    print("put {s} at revision {d}\n", .{
+        prefix ++ "greeting",
+        if (put_value.header) |header| header.revision else 0,
     });
-    defer iter.deinit();
 
-    while (iter.next()) |resp| {
-        var r = resp;
-        defer r.deinit(allocator);
+    var range_buffer: [64]u8 = undefined;
+    const target: etcd.KeyRange = .{ .prefix = prefix };
+    const bounds = try target.bounds(&range_buffer);
+    var list = try client.range(.{ .key = bounds.key, .range_end = bounds.range_end }, .{});
+    defer list.deinit();
+    for ((try list.tryValue()).kvs) |kv| {
+        print("  {s} = {s}\n", .{ kv.key, kv.value });
+    }
 
-        if (resp.created) {
-            log.info("watch: created (watch_id={d})", .{resp.watch_id});
-            continue;
-        }
+    var watcher = try etcd.Watcher.init(init.gpa, io, endpoint, .{
+        .target = .{ .prefix = prefix },
+    });
+    defer watcher.deinit();
 
-        for (resp.events.items) |event| {
-            const type_str: []const u8 = switch (event.type) {
-                .PUT => "PUT",
-                .DELETE => "DELETE",
-                _ => "UNKNOWN",
-            };
-            if (event.kv) |kv| {
-                log.info("watch: {s} key={s} value={s} mod_revision={d}", .{
-                    type_str, kv.key, kv.value, kv.mod_revision,
-                });
-            }
+    const watch_id = blk: {
+        var created = (try watcher.next()) orelse return error.WatchClosed;
+        defer created.deinit();
+        if (!created.value.created) return error.WatchNotCreated;
+        print("watch {d} created at revision {d}\n", .{
+            created.value.watch_id,
+            created.value.header.?.revision,
+        });
+        break :blk created.value.watch_id;
+    };
+
+    var update = try client.put(.{ .key = prefix ++ "greeting", .value = "universe" }, .{});
+    defer update.deinit();
+    _ = try update.tryValue();
+
+    {
+        var event = (try watcher.next()) orelse return error.WatchClosed;
+        defer event.deinit();
+        for (event.value.events) |entry| {
+            print("event {s} {s} = {s} at revision {d}\n", .{
+                @tagName(entry.type),
+                entry.kv.key,
+                entry.kv.value,
+                entry.kv.mod_revision,
+            });
         }
     }
 
-    log.info("watch ended (canceled by server)", .{});
-}
+    var deleted = try client.deleteRange(.{
+        .key = bounds.key,
+        .range_end = bounds.range_end,
+    }, .{});
+    defer deleted.deinit();
+    const deleted_value = try deleted.tryValue();
+    print("deleted {d} keys\n", .{deleted_value.deleted});
 
-fn encodePb(comptime T: type, allocator: Allocator, msg: T) ![]const u8 {
-    var buf: Io.Writer.Allocating = .init(allocator);
-    defer buf.deinit();
-    try msg.encode(&buf.writer, allocator);
-    return buf.toOwnedSlice();
+    try watcher.cancel(watch_id);
+    // The delete above and the cancel can both be waiting. Drain them, and
+    // free each response, until the canceled response ends the iteration.
+    while (try watcher.next()) |response| {
+        var discarded = response;
+        discarded.deinit();
+    }
+    print("watch canceled\n", .{});
 }

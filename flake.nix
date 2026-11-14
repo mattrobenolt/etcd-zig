@@ -23,12 +23,14 @@
           pkgs = inputs.nixpkgs.legacyPackages.${system}.extend mattware.overlays.default;
         in
         {
+          formatter = pkgs.nixfmt-tree;
+
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               etcd
               protobuf
-              zig_0_15
-              zls_0_15
+              zig_0_17
+              zls_0_17
               ziglint
               zigdoc
             ];

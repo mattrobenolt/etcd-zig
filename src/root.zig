@@ -1,23 +1,93 @@
+//! An etcd client for Zig 0.17, built on baskingspot/grpc and
+//! baskingspot/protobuf.
+//!
+//! `Client` owns one connection and turns a request struct into one gRPC
+//! call. `Watcher` owns a second connection for a watch that reconnects.
+//! The etcd messages are plain structs in `etcdserverpb` and `mvccpb`; no
+//! code generation is involved.
+
+const std = @import("std");
+
+const pb = @import("protobuf");
+
 pub const auth = @import("auth.zig");
-pub const grpc = @import("grpc.zig");
-pub const H2Connection = @import("h2_connection.zig").H2Connection;
-pub const etcdserverpb = @import("proto/etcdserverpb.pb.zig");
-pub const mvccpb = @import("proto/mvccpb.pb.zig");
+pub const client = @import("client.zig");
+pub const Client = client.Client;
+pub const Reply = client.Reply;
+pub const CallOptions = client.CallOptions;
+pub const OpenOptions = client.OpenOptions;
+pub const ClientOptions = client.Options;
+pub const AuthResult = client.AuthResult;
+pub const Header = client.Header;
+pub const endpoint = @import("endpoint.zig");
+pub const etcdserverpb = @import("etcdserverpb.zig");
+pub const mvccpb = @import("mvccpb.zig");
+pub const range = @import("range.zig");
+pub const KeyRange = range.KeyRange;
+pub const Range = range.Range;
+pub const prefixEnd = range.prefixEnd;
 pub const watch = @import("watch.zig");
-pub const WatchIterator = watch.WatchIterator;
-pub const KeyRange = watch.KeyRange;
-pub const PrefixEnd = watch.PrefixEnd;
-
-pub const c = @cImport({
-    @cInclude("nghttp2/nghttp2.h");
-});
-
-test "nghttp2 linked" {
-    const info = c.nghttp2_version(0);
-    const std = @import("std");
-    try std.testing.expect(info != null);
-}
+pub const Watcher = watch.Watcher;
+pub const WatchOptions = watch.Options;
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = auth;
+    _ = client;
+    _ = endpoint;
+    _ = etcdserverpb;
+    _ = mvccpb;
+    _ = range;
+    _ = watch;
+}
+
+test "PutRequest keeps etcd's field numbers" {
+    const request: etcdserverpb.PutRequest = .{
+        .key = "hello",
+        .value = "world",
+        .lease = 7,
+        .prev_kv = true,
+    };
+
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try pb.encode(etcdserverpb.PutRequest, request, .{}, &writer);
+
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    var parsed = try pb.decode(etcdserverpb.PutRequest, std.testing.allocator, &reader, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("hello", parsed.value.key);
+    try std.testing.expectEqualStrings("world", parsed.value.value);
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.lease);
+    try std.testing.expect(parsed.value.prev_kv);
+}
+
+test "WatchResponse decodes repeated events" {
+    const response: etcdserverpb.WatchResponse = .{
+        .header = .{ .revision = 99 },
+        .watch_id = 3,
+        .events = &.{
+            .{ .type = .put, .kv = .{ .key = "a", .value = "1", .mod_revision = 98 } },
+            .{ .type = .delete, .kv = .{ .key = "b", .mod_revision = 99 } },
+        },
+    };
+
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try pb.encode(etcdserverpb.WatchResponse, response, .{}, &writer);
+
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    var parsed = try pb.decode(
+        etcdserverpb.WatchResponse,
+        std.testing.allocator,
+        &reader,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(i64, 99), parsed.value.header.?.revision);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.events.len);
+    try std.testing.expectEqual(mvccpb.Event.Type.put, parsed.value.events[0].type);
+    try std.testing.expectEqualStrings("a", parsed.value.events[0].kv.key);
+    try std.testing.expectEqual(mvccpb.Event.Type.delete, parsed.value.events[1].type);
 }

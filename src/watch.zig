@@ -1,284 +1,365 @@
+//! A watch that survives reconnects.
+//!
+//! A watch is a gRPC server stream that stays open for the life of the
+//! process. This module owns one connection for that stream, creates the
+//! watch, tracks the last revision, and reconnects with `start_revision`
+//! set past what was already delivered. A server-side cancel ends the
+//! iteration; every transport failure is retried.
+
 const std = @import("std");
 const Io = std.Io;
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const testing = std.testing;
+const mem = std.mem;
+const crypto = std.crypto;
+const Allocator = mem.Allocator;
 
-const grpc = @import("grpc.zig");
-const H2Connection = @import("h2_connection.zig").H2Connection;
-const etcdserverpb = @import("proto/etcdserverpb.pb.zig");
+const grpc = @import("grpc");
+const pb = @import("protobuf");
+const time = @import("stdx").time;
 
-const log = std.log.scoped(.watch);
+const auth = @import("auth.zig");
+const Client = @import("client.zig").Client;
+const Endpoint = @import("endpoint.zig").Endpoint;
+const etcdserverpb = @import("etcdserverpb.zig");
+const KeyRange = @import("range.zig").KeyRange;
+const watch_service = @import("client.zig").watch_service;
 
-/// The result of computing a prefix end bound.
-pub const PrefixEnd = union(enum) {
-    /// An allocated upper bound. Caller must free with the same allocator.
-    owned: []u8,
-    /// The prefix is all 0xFF — range covers everything from prefix onward.
-    unbounded,
+const log = std.log.scoped(.etcd_watch);
 
-    fn deinit(self: PrefixEnd, gpa: Allocator) void {
-        switch (self) {
-            .owned => |s| gpa.free(s),
-            .unbounded => {},
-        }
-    }
+const Session = struct {
+    client: Client,
+    calls: [1]grpc.Call = undefined,
+};
 
-    /// Returns the wire representation for etcd range_end.
-    /// `.unbounded` maps to "" (etcd convention for no upper bound).
-    fn toSlice(self: PrefixEnd) []const u8 {
-        return switch (self) {
-            .owned => |s| s,
-            .unbounded => "",
+const Next = union(enum) {
+    response: pb.Parsed(etcdserverpb.WatchResponse),
+    closed,
+    canceled,
+};
+
+pub const Options = struct {
+    target: KeyRange = .all,
+    /// Zero watches live changes. A reconnect resumes from the last revision
+    /// already delivered plus one, so this value only applies to the first
+    /// connection.
+    start_revision: i64 = 0,
+    prev_kv: bool = false,
+    progress_notify: bool = false,
+    /// When set, every connection authenticates with these credentials.
+    credentials: ?auth.Credentials = null,
+    /// A token to use when credentials are not set. The watcher copies it.
+    token: ?[]const u8 = null,
+    retry_delay: time.Duration = .fromSecondsComptime(1),
+    /// The unary reply space for the authentication calls. Small is enough.
+    reply_capacity: usize = 64 * 1024,
+};
+
+const OwnedTarget = struct {
+    buffer: []u8,
+    range: KeyRange,
+
+    fn init(gpa: Allocator, target: KeyRange) !OwnedTarget {
+        const buffer = try gpa.alloc(u8, target.storageLen());
+        errdefer gpa.free(buffer);
+
+        var offset: usize = 0;
+        const range: KeyRange = switch (target) {
+            .single => |key| .{ .single = copyInto(buffer, &offset, key) },
+            .prefix => |prefix| .{ .prefix = copyInto(buffer, &offset, prefix) },
+            .range => |explicit| .{ .range = .{
+                .start = copyInto(buffer, &offset, explicit.start),
+                .end = copyInto(buffer, &offset, explicit.end),
+            } },
+            .all => .all,
         };
+        return .{ .buffer = buffer, .range = range };
     }
 };
 
-/// Computes the end of the key range that covers all keys with
-/// the given prefix. For example, "foo" yields "fop".
-/// If the prefix consists entirely of 0xFF bytes, returns
-/// `.unbounded` (all keys from prefix to end of keyspace).
-fn prefixEnd(gpa: Allocator, prefix: []const u8) Allocator.Error!PrefixEnd {
-    // Find the last byte that is not 0xFF.
-    var i: usize = prefix.len;
-    while (i > 0) {
-        i -= 1;
-        if (prefix[i] < 0xFF) {
-            const end = try gpa.dupe(u8, prefix[0 .. i + 1]);
-            end[i] += 1;
-            return .{ .owned = end };
-        }
-    }
-    return .unbounded;
+fn copyInto(buffer: []u8, offset: *usize, bytes: []const u8) []const u8 {
+    const start = offset.*;
+    @memcpy(buffer[start..][0..bytes.len], bytes);
+    offset.* = start + bytes.len;
+    return buffer[start..offset.*];
 }
 
-/// The key range to watch.
-pub const KeyRange = union(enum) {
-    /// Watch a single key.
-    single: []const u8,
-    /// Watch all keys with a given prefix.
-    prefix: []const u8,
-    /// Watch an explicit half-open range [start, end).
-    range: struct { start: []const u8, end: []const u8 },
-    /// Watch the entire keyspace.
-    all,
-
-    /// Returns the (key, range_end) pair for the etcd WatchCreateRequest.
-    const WireRange = struct { key: []const u8, range_end: []const u8, prefix_end: ?PrefixEnd };
-
-    fn toWireRange(self: KeyRange, gpa: Allocator) Allocator.Error!WireRange {
-        return switch (self) {
-            .single => |k| .{ .key = k, .range_end = "", .prefix_end = null },
-            .prefix => |p| {
-                const pe = try prefixEnd(gpa, p);
-                return .{ .key = p, .range_end = pe.toSlice(), .prefix_end = pe };
-            },
-            .range => |r| .{ .key = r.start, .range_end = r.end, .prefix_end = null },
-            .all => .{ .key = "\x00", .range_end = "\x00", .prefix_end = null },
-        };
-    }
-};
-
-/// Iterator that encapsulates the full watch lifecycle: connecting, handshaking,
-/// opening a gRPC server stream for etcd Watch, decoding responses, and
-/// transparently reconnecting on transient failures.
-///
-/// Usage:
-///   var iter: WatchIterator = .init(gpa, "localhost", 2379, .{ .target = .all });
-///   defer iter.deinit();
-///   while (iter.next()) |resp| {
-///       defer resp.deinit(gpa);
-///       // process resp.events, etc.
-///   }
-///   // null means the watch was canceled by the server (non-recoverable).
-pub const WatchIterator = struct {
-    // Config (immutable after init)
+pub const Watcher = struct {
     gpa: Allocator,
     io: Io,
-    host: []const u8,
-    port: u16,
+    endpoint: []u8,
     target: KeyRange,
+    target_buffer: []u8,
+    start_revision: i64,
     prev_kv: bool,
-
-    // Mutable state
+    progress_notify: bool,
+    credentials: ?auth.OwnedCredentials,
+    token: ?[]u8,
+    retry_delay: time.Duration,
+    reply_capacity: usize,
     last_revision: i64,
-    conn: ?H2Connection,
-    stream: ?grpc.GrpcStreamReader,
+    session: ?*Session = null,
+    stream: ?grpc.Stream = null,
 
-    pub const Options = struct {
-        target: KeyRange = .all,
-        start_revision: i64 = 0,
-        prev_kv: bool = false,
-    };
+    pub fn init(
+        gpa: Allocator,
+        // ziglint-ignore: Z023 -- the allocator stays first to mirror Client.init.
+        io: Io,
+        endpoint: []const u8,
+        options: Options,
+    ) !Watcher {
+        _ = try Endpoint.parse(endpoint);
 
-    pub fn init(gpa: Allocator, io: Io, host: []const u8, port: u16, opts: Options) WatchIterator {
+        const endpoint_copy = try gpa.dupe(u8, endpoint);
+        errdefer gpa.free(endpoint_copy);
+
+        const target = try OwnedTarget.init(gpa, options.target);
+        errdefer gpa.free(target.buffer);
+
+        var credentials: ?auth.OwnedCredentials = null;
+        if (options.credentials) |value| credentials = try .init(gpa, value);
+        errdefer if (credentials) |*value| value.deinit(gpa);
+
+        var token: ?[]u8 = null;
+        if (options.token) |value| token = try gpa.dupe(u8, value);
+        errdefer if (token) |value| {
+            crypto.secureZero(u8, value);
+            gpa.free(value);
+        };
+
         return .{
             .gpa = gpa,
             .io = io,
-            .host = host,
-            .port = port,
-            .target = opts.target,
-            .prev_kv = opts.prev_kv,
-            .last_revision = opts.start_revision,
-            .conn = null,
-            .stream = null,
+            .endpoint = endpoint_copy,
+            .target = target.range,
+            .target_buffer = target.buffer,
+            .start_revision = options.start_revision,
+            .prev_kv = options.prev_kv,
+            .progress_notify = options.progress_notify,
+            .credentials = credentials,
+            .token = token,
+            .retry_delay = options.retry_delay,
+            .reply_capacity = options.reply_capacity,
+            .last_revision = 0,
         };
     }
 
-    pub fn deinit(self: *WatchIterator) void {
+    pub fn deinit(self: *Watcher) void {
         self.teardown();
+        self.gpa.free(self.endpoint);
+        self.gpa.free(self.target_buffer);
+        if (self.credentials) |*credentials| credentials.deinit(self.gpa);
+        if (self.token) |token| {
+            crypto.secureZero(u8, token);
+            self.gpa.free(token);
+        }
         self.* = undefined;
     }
 
-    /// Returns the next WatchResponse from the stream. Blocks until a response
-    /// is available, reconnecting transparently on transient errors. Returns
-    /// null only if the watch is canceled by the server (non-recoverable).
-    /// The returned WatchResponse is owned by the caller; call
-    /// `resp.deinit(allocator)` when done.
-    pub fn next(self: *WatchIterator) ?etcdserverpb.WatchResponse {
+    /// The next watch response, or null when the server canceled the watch.
+    /// A transport failure reconnects after `retry_delay`; only a fatal error
+    /// (out of memory, bad credentials) returns an error.
+    pub fn next(self: *Watcher) !?pb.Parsed(etcdserverpb.WatchResponse) {
         while (true) {
-            // Ensure we have a live connection and stream.
             if (self.stream == null) {
                 self.establish() catch |err| {
-                    log.warn("establish failed: {s}, retrying in 1s...", .{@errorName(err)});
+                    if (isFatal(err)) return err;
+                    log.warn("watch connect failed: {s}; retrying", .{@errorName(err)});
                     self.teardown();
-                    Io.sleep(self.io, .fromNanoseconds(std.time.ns_per_s), .awake) catch {};
+                    self.sleepRetry();
                     continue;
                 };
             }
 
-            // Read the next gRPC frame from the stream.
-            const msg_bytes = self.stream.?.next(self.gpa) catch |err| {
-                log.warn("stream read error: {s}, reconnecting...", .{@errorName(err)});
+            const outcome = self.read() catch |err| {
+                log.warn("watch read failed: {s}; reconnecting", .{@errorName(err)});
                 self.teardown();
-                Io.sleep(self.io, .fromNanoseconds(std.time.ns_per_s), .awake) catch {};
+                self.sleepRetry();
                 continue;
             };
 
-            if (msg_bytes) |bytes| {
-                defer self.gpa.free(bytes);
-
-                var reader: Io.Reader = .fixed(bytes);
-                var resp = etcdserverpb.WatchResponse.decode(&reader, self.gpa) catch |err| {
-                    log.warn("decode error: {s}, skipping frame", .{@errorName(err)});
-                    continue;
-                };
-
-                // Track the latest revision for reconnect.
-                if (resp.header) |hdr| {
-                    if (hdr.revision > self.last_revision) {
-                        self.last_revision = hdr.revision;
-                    }
-                }
-
-                // A server-side cancel is non-recoverable; signal end of iteration.
-                if (resp.canceled) {
-                    log.info("canceled by server (compact_revision={d})", .{
-                        resp.compact_revision,
-                    });
-                    resp.deinit(self.gpa);
+            switch (outcome) {
+                .response => |response| return response,
+                .closed => {
+                    self.teardown();
+                    self.sleepRetry();
+                },
+                .canceled => {
+                    self.teardown();
                     return null;
-                }
-
-                return resp;
-            } else {
-                // stream.next() returned null => stream closed by server.
-                log.warn("stream closed, reconnecting...", .{});
-                self.teardown();
-                Io.sleep(self.io, .fromNanoseconds(std.time.ns_per_s), .awake) catch {};
-                continue;
+                },
             }
         }
     }
 
-    // -- internal helpers --
+    /// Send a WatchCancelRequest. The confirmation arrives from `next` as a
+    /// response with `canceled` set, and then `next` returns null.
+    pub fn cancel(self: *Watcher, watch_id: i64) !void {
+        const stream = if (self.stream) |*stream| stream else return error.NotConnected;
+        return self.send(stream, .{ .request = .{ .cancel_request = .{
+            .watch_id = watch_id,
+        } } });
+    }
 
-    fn teardown(self: *WatchIterator) void {
-        if (self.stream) |*s| {
-            s.deinit();
-            self.stream = null;
-        }
-        if (self.conn) |*cn| {
-            cn.deinit();
-            self.conn = null;
+    /// The highest revision seen in a response header, or the starting
+    /// revision before the first response.
+    pub fn lastRevision(self: *const Watcher) i64 {
+        return if (self.last_revision != 0) self.last_revision else self.start_revision;
+    }
+
+    /// Send a WatchProgressRequest. The server answers with a response whose
+    /// header carries its current revision.
+    pub fn requestProgress(self: *Watcher) !void {
+        const stream = if (self.stream) |*stream| stream else return error.NotConnected;
+        return self.send(stream, .{ .request = .{ .progress_request = .{} } });
+    }
+
+    fn read(self: *Watcher) !Next {
+        const stream = if (self.stream) |*stream| stream else return error.NotConnected;
+        while (true) {
+            if (try stream.nextMessage()) |message| {
+                var reader: Io.Reader = .fixed(message.bytes);
+                var parsed = pb.decode(
+                    etcdserverpb.WatchResponse,
+                    self.gpa,
+                    &reader,
+                    .{},
+                ) catch |err| {
+                    log.warn("watch decode failed: {s}; skipping message", .{@errorName(err)});
+                    continue;
+                };
+
+                self.observe(parsed.value);
+                if (parsed.value.canceled) {
+                    log.info("watch canceled at compact revision {d}: {s}", .{
+                        parsed.value.compact_revision,
+                        parsed.value.cancel_reason,
+                    });
+                    parsed.deinit();
+                    return .canceled;
+                }
+                return .{ .response = parsed };
+            }
+
+            if (stream.result()) |result| {
+                if (result.code == .ok) return .closed;
+                log.warn("watch stream ended: {s} {s}", .{
+                    @tagName(result.code),
+                    result.message,
+                });
+                // A token failure only heals with credentials. Without them,
+                // reconnecting would replay the same rejection forever.
+                if (auth.needsReauth(result.message) and self.credentials == null) {
+                    return error.AuthenticationRequired;
+                }
+                return .closed;
+            }
+
+            if (!try stream.advance()) return .closed;
         }
     }
 
-    fn establish(self: *WatchIterator) !void {
-        assert(self.conn == null);
-        assert(self.stream == null);
+    fn establish(self: *Watcher) !void {
+        const session = try self.gpa.create(Session);
+        errdefer self.gpa.destroy(session);
 
-        // Connect and handshake.
-        var conn: H2Connection = try .connect(self.io, self.host, self.port);
-        errdefer conn.deinit();
-        try conn.performHandshake();
-
-        self.conn = conn;
-
-        // Build the WatchCreateRequest starting from last_revision + 1 so
-        // we resume without missing events.
-        const start_rev = if (self.last_revision > 0) self.last_revision + 1 else 0;
-
-        const wire = try self.target.toWireRange(self.gpa);
-        defer if (wire.prefix_end) |pe| pe.deinit(self.gpa);
-
-        const req_bytes = try encodePb(etcdserverpb.WatchRequest, self.gpa, .{
-            .create_request = .{
-                .key = wire.key,
-                .range_end = wire.range_end,
-                .start_revision = start_rev,
-                .prev_kv = self.prev_kv,
-            },
+        try session.client.init(self.gpa, self.io, self.endpoint, .{
+            .reply_capacity = self.reply_capacity,
         });
-        defer self.gpa.free(req_bytes);
+        errdefer session.client.deinit();
 
-        // openServerStream returns by value; we store it into self.stream,
-        // then call activate() to fix the nghttp2 stream_user_data pointer.
-        self.stream = try grpc.openServerStream(
-            self.gpa,
-            &self.conn.?,
-            "/etcdserverpb.Watch/Watch",
-            req_bytes,
-        );
-        self.stream.?.activate();
+        if (self.credentials) |*credentials| {
+            const result = session.client.authenticate(.{
+                .username = credentials.username,
+                .password = credentials.password,
+            }, .{}) catch |err| {
+                log.warn("watch authentication failed: {s}", .{@errorName(err)});
+                return error.AuthenticationFailed;
+            };
+            if (result == .disabled) log.debug("watch: authentication is disabled", .{});
+        } else if (self.token) |token| {
+            try session.client.setToken(token);
+        }
 
-        log.info("established (start_revision={d})", .{start_rev});
+        session.calls[0] = try session.client.open(watch_service, "Watch", .{});
+        errdefer session.calls[0].deinit();
+
+        var stream = session.client.stream(&session.calls[0], session.calls[0..]);
+        try self.sendCreate(&stream);
+
+        self.session = session;
+        self.stream = stream;
+        log.info("watch established from revision {d}", .{self.lastRevision()});
+    }
+
+    fn sendCreate(self: *Watcher, stream: *grpc.Stream) !void {
+        const scratch = try self.gpa.alloc(u8, self.target.bufferLen());
+        defer self.gpa.free(scratch);
+        const bounds = try self.target.bounds(scratch);
+
+        const start_revision = if (self.last_revision != 0)
+            self.last_revision + 1
+        else
+            self.start_revision;
+
+        return self.send(stream, .{ .request = .{ .create_request = .{
+            .key = bounds.key,
+            .range_end = bounds.range_end,
+            .start_revision = start_revision,
+            .prev_kv = self.prev_kv,
+            .progress_notify = self.progress_notify,
+        } } });
+    }
+
+    fn send(self: *Watcher, stream: *grpc.Stream, request: etcdserverpb.WatchRequest) !void {
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        try pb.encode(etcdserverpb.WatchRequest, request, .{}, &out.writer);
+
+        while (!try stream.send(out.written())) {
+            if (!try stream.advance()) return error.WatchSendBlocked;
+        }
+    }
+
+    fn observe(self: *Watcher, response: etcdserverpb.WatchResponse) void {
+        const header = response.header orelse return;
+        if (header.revision > self.last_revision) self.last_revision = header.revision;
+    }
+
+    fn teardown(self: *Watcher) void {
+        if (self.stream) |*stream| {
+            stream.deinit();
+            self.stream = null;
+        }
+        if (self.session) |session| {
+            session.client.deinit();
+            self.gpa.destroy(session);
+            self.session = null;
+        }
+    }
+
+    fn sleepRetry(self: *Watcher) void {
+        const delay: Io.Duration = .fromNanoseconds(self.retry_delay.nanoseconds);
+        Io.sleep(self.io, delay, .awake) catch |err|
+            log.debug("watch retry sleep failed: {s}", .{@errorName(err)});
     }
 };
 
-fn encodePb(comptime T: type, allocator: Allocator, msg: T) ![]const u8 {
-    var buf: Io.Writer.Allocating = .init(allocator);
-    defer buf.deinit();
-    try msg.encode(&buf.writer, allocator);
-    return buf.toOwnedSlice();
+fn isFatal(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.AuthenticationFailed,
+        error.AuthenticationRequired,
+        => true,
+        else => false,
+    };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+test "Watcher owns a copy of its target" {
+    var prefix = "app/".*;
+    var watcher = try Watcher.init(std.testing.allocator, std.testing.io, "127.0.0.1:2379", .{
+        .target = .{ .prefix = &prefix },
+    });
+    defer watcher.deinit();
 
-test "prefixEnd: normal prefix" {
-    const gpa = testing.allocator;
-    const pe = try prefixEnd(gpa, "foo");
-    defer pe.deinit(gpa);
-    try testing.expectEqualSlices(u8, "fop", pe.owned);
-}
-
-test "prefixEnd: single byte" {
-    const gpa = testing.allocator;
-    const pe = try prefixEnd(gpa, "a");
-    defer pe.deinit(gpa);
-    try testing.expectEqualSlices(u8, "b", pe.owned);
-}
-
-test "prefixEnd: trailing 0xFF bytes are stripped" {
-    const gpa = testing.allocator;
-    const pe = try prefixEnd(gpa, "a\xFF\xFF");
-    defer pe.deinit(gpa);
-    try testing.expectEqualSlices(u8, "b", pe.owned);
-}
-
-test "prefixEnd: all 0xFF yields unbounded" {
-    const pe = try prefixEnd(testing.allocator, "\xFF\xFF\xFF");
-    try testing.expect(pe == .unbounded);
+    @memset(&prefix, 'x');
+    try std.testing.expectEqualStrings("app/", watcher.target.prefix);
 }

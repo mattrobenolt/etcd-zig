@@ -4,80 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const nghttp2_dep = b.dependency("nghttp2", .{});
+    const grpc_dep = b.dependency("grpc", .{ .target = target, .optimize = optimize });
+    const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
+    const stdx_dep = b.dependency("stdx", .{ .target = target, .optimize = optimize });
 
-    // Build nghttp2 C sources as a static library.
-    const nghttp2 = b.addLibrary(.{
-        .name = "nghttp2",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    nghttp2.root_module.addIncludePath(nghttp2_dep.path("lib/includes"));
-    nghttp2.root_module.addIncludePath(nghttp2_dep.path("lib"));
-
-    const nghttp2_sources: []const []const u8 = &.{
-        "nghttp2_alpn.c",
-        "nghttp2_buf.c",
-        "nghttp2_callbacks.c",
-        "nghttp2_debug.c",
-        "nghttp2_extpri.c",
-        "nghttp2_frame.c",
-        "nghttp2_hd.c",
-        "nghttp2_hd_huffman.c",
-        "nghttp2_hd_huffman_data.c",
-        "nghttp2_helper.c",
-        "nghttp2_http.c",
-        "nghttp2_map.c",
-        "nghttp2_mem.c",
-        "nghttp2_option.c",
-        "nghttp2_outbound_item.c",
-        "nghttp2_pq.c",
-        "nghttp2_priority_spec.c",
-        "nghttp2_queue.c",
-        "nghttp2_ratelim.c",
-        "nghttp2_rcbuf.c",
-        "nghttp2_session.c",
-        "nghttp2_stream.c",
-        "nghttp2_submit.c",
-        "nghttp2_time.c",
-        "nghttp2_version.c",
-        "sfparse.c",
-    };
-
-    const non_windows_flags: []const []const u8 = &.{
-        "-DHAVE_ARPA_INET_H",
-        "-DHAVE_NETINET_IN_H",
-        "-DHAVE_CLOCK_GETTIME",
-        "-DHAVE_DECL_CLOCK_MONOTONIC=1",
-    };
-    const no_flags: []const []const u8 = &.{};
-
-    nghttp2.root_module.addCSourceFiles(.{
-        .root = nghttp2_dep.path("lib"),
-        .files = nghttp2_sources,
-        .flags = if (target.result.os.tag != .windows) non_windows_flags else no_flags,
-    });
-
-    // Protobuf runtime module.
-    const protobuf_dep = b.dependency("protobuf", .{});
-    const protobuf_mod = protobuf_dep.module("protobuf");
-
-    // Library module — the public API of this package.
     const mod = b.addModule("etcd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
-            .{ .name = "protobuf", .module = protobuf_mod },
+            .{ .name = "grpc", .module = grpc_dep.module("grpc") },
+            .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
+            .{ .name = "stdx", .module = stdx_dep.module("stdx") },
         },
     });
-    mod.addIncludePath(nghttp2_dep.path("lib/includes"));
-    mod.linkLibrary(nghttp2);
 
-    // Executable.
+    // A consumer configures this module and stops here. The demo and the
+    // test runner stay on the development side of the line.
+    if (b.pkg_hash.len != 0) return;
+
     const exe = b.addExecutable(.{
         .name = "etcd",
         .root_module = b.createModule(.{
@@ -86,45 +31,89 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "etcd", .module = mod },
-                .{ .name = "protobuf", .module = protobuf_mod },
             },
         }),
     });
-    exe.root_module.addIncludePath(nghttp2_dep.path("lib/includes"));
-    exe.root_module.linkLibrary(nghttp2);
+    b.installArtifact(exe);
 
-    // Build the protoc-gen-zig plugin for codegen.
-    const protoc_gen_zig = b.addExecutable(.{
-        .name = "protoc-gen-zig",
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
+    b.step("run", "Run the etcd demo").dependOn(&run_cmd.step);
+
+    // The benchmark harness runs against a live etcd. It is dev-only, like
+    // the demo and the tests.
+    const bench = b.addExecutable(.{
+        .name = "bench",
         .root_module = b.createModule(.{
-            .root_source_file = protobuf_dep.path("bootstrapped-generator/main.zig"),
+            .root_source_file = b.path("bench/bench.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "protobuf", .module = protobuf_mod },
+                .{ .name = "etcd", .module = mod },
             },
         }),
     });
-    b.installArtifact(protoc_gen_zig);
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+    b.step("bench", "Run the benchmark against a live etcd").dependOn(&run_bench.step);
 
-    b.installArtifact(exe);
+    // The test runner and the integration harness are dev-only. Both are
+    // lazy dependencies so a consumer of the package never fetches them.
+    const testingx_dep = b.lazyDependency("testingx", .{ .target = target }) orelse
+        return;
+    const test_runner: std.Build.Step.Compile.TestRunner = .{
+        .path = testingx_dep.path("src/runner.zig"),
+        .mode = .simple,
+    };
 
-    const run_step = b.step("run", "Run the app");
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    const tests = b.addTest(.{
+        .root_module = mod,
+        .test_runner = test_runner,
+    });
+    const run_tests = b.addRunArtifact(tests);
+    run_tests.addPassthruArgs();
+    b.step("test", "Run the unit tests").dependOn(&run_tests.step);
+
+    // `zig build test-integration -Detcd-endpoint=127.0.0.1:2379`.
+    // The justfile starts a throwaway etcd and passes the endpoint.
+    const endpoint = b.option([]const u8, "etcd-endpoint", "Endpoint for the integration tests");
+    if (endpoint) |value| {
+        const config = b.addOptions();
+        config.addOption([]const u8, "endpoint", value);
+        config.addOption(
+            []const u8,
+            "auth_endpoint",
+            b.option([]const u8, "etcd-auth-endpoint", "Auth-enabled endpoint") orelse "",
+        );
+        config.addOption(
+            []const u8,
+            "auth_user",
+            b.option([]const u8, "etcd-auth-user", "Auth-enabled user") orelse "",
+        );
+        config.addOption(
+            []const u8,
+            "auth_password",
+            b.option([]const u8, "etcd-auth-password", "Auth-enabled password") orelse "",
+        );
+
+        const integration_mod = b.createModule(.{
+            .root_source_file = b.path("src/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "etcd", .module = mod },
+                .{ .name = "config", .module = config.createModule() },
+            },
+        });
+        const integration_tests = b.addTest(.{
+            .root_module = integration_mod,
+            .test_runner = test_runner,
+        });
+        const run_integration = b.addRunArtifact(integration_tests);
+        run_integration.addPassthruArgs();
+        b.step("test-integration", "Run the tests against a live etcd")
+            .dependOn(&run_integration.step);
     }
-
-    // Tests.
-    const mod_tests = b.addTest(.{ .root_module = mod });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
 }
