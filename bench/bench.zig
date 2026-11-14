@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const mem = std.mem;
 const Allocator = std.mem.Allocator;
 
 const etcd = @import("etcd");
@@ -30,13 +31,13 @@ pub fn main(init: std.process.Init) !void {
     try client.init(gpa, io, endpoint, .{});
     defer client.deinit();
 
-    if (std.mem.eql(u8, mode, "all") or std.mem.eql(u8, mode, "put")) {
+    if (mem.eql(u8, mode, "all") or mem.eql(u8, mode, "put")) {
         try benchPut(io, &client, iterations);
     }
-    if (std.mem.eql(u8, mode, "all") or std.mem.eql(u8, mode, "range")) {
+    if (mem.eql(u8, mode, "all") or mem.eql(u8, mode, "range")) {
         try benchRange(io, &client, iterations);
     }
-    if (std.mem.eql(u8, mode, "all") or std.mem.eql(u8, mode, "watch")) {
+    if (mem.eql(u8, mode, "all") or mem.eql(u8, mode, "watch")) {
         try benchWatch(gpa, io, endpoint, &client, iterations);
     }
 }
@@ -111,7 +112,7 @@ fn warmup(client: *etcd.Client, mode: []const u8, iterations: u32) !void {
     const count = @min(iterations / 10, 1000);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        if (std.mem.eql(u8, mode, "put")) {
+        if (mem.eql(u8, mode, "put")) {
             try put(client, default_key, "warm");
         } else {
             var reply = try client.range(.{ .key = default_key, .limit = 1 }, .{});

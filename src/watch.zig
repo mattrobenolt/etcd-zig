@@ -11,6 +11,7 @@ const Io = std.Io;
 const mem = std.mem;
 const crypto = std.crypto;
 const Allocator = mem.Allocator;
+const testing = std.testing;
 
 const grpc = @import("grpc");
 const pb = @import("protobuf");
@@ -338,7 +339,7 @@ pub const Watcher = struct {
 
     fn sleepRetry(self: *Watcher) void {
         const delay: Io.Duration = .fromNanoseconds(self.retry_delay.nanoseconds);
-        Io.sleep(self.io, delay, .awake) catch |err|
+        self.io.sleep(delay, .awake) catch |err|
             log.debug("watch retry sleep failed: {s}", .{@errorName(err)});
     }
 };
@@ -355,11 +356,11 @@ fn isFatal(err: anyerror) bool {
 
 test "Watcher owns a copy of its target" {
     var prefix = "app/".*;
-    var watcher = try Watcher.init(std.testing.allocator, std.testing.io, "127.0.0.1:2379", .{
+    var watcher: Watcher = try .init(testing.allocator, testing.io, "127.0.0.1:2379", .{
         .target = .{ .prefix = &prefix },
     });
     defer watcher.deinit();
 
     @memset(&prefix, 'x');
-    try std.testing.expectEqualStrings("app/", watcher.target.prefix);
+    try testing.expectEqualStrings("app/", watcher.target.prefix);
 }

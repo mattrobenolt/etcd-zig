@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
 const crypto = std.crypto;
+const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -463,9 +464,9 @@ test "fillMetadata: no token passes the extra fields through" {
     const extra = [_]Header{.{ .name = "x-test", .value = "1" }};
     const metadata = try fillMetadata(null, &extra, &storage);
 
-    try std.testing.expectEqual(@as(usize, 1), metadata.len);
-    try std.testing.expectEqualStrings("x-test", metadata[0].name);
-    try std.testing.expectEqualStrings("1", metadata[0].value);
+    try testing.expectEqual(@as(usize, 1), metadata.len);
+    try testing.expectEqualStrings("x-test", metadata[0].name);
+    try testing.expectEqualStrings("1", metadata[0].value);
 }
 
 test "fillMetadata: the token comes first" {
@@ -473,27 +474,27 @@ test "fillMetadata: the token comes first" {
     const extra = [_]Header{.{ .name = "x-test", .value = "1" }};
     const metadata = try fillMetadata("a-token", &extra, &storage);
 
-    try std.testing.expectEqual(@as(usize, 2), metadata.len);
-    try std.testing.expectEqualStrings(auth.token_header_name, metadata[0].name);
-    try std.testing.expectEqualStrings("a-token", metadata[0].value);
-    try std.testing.expectEqualStrings("x-test", metadata[1].name);
+    try testing.expectEqual(@as(usize, 2), metadata.len);
+    try testing.expectEqualStrings(auth.token_header_name, metadata[0].name);
+    try testing.expectEqualStrings("a-token", metadata[0].value);
+    try testing.expectEqualStrings("x-test", metadata[1].name);
 }
 
 test "fillMetadata: a full set is accepted and one more is not" {
     var storage: [max_headers + 1]Header = undefined;
     const full: [max_headers]Header = @splat(.{ .name = "x", .value = "v" });
     const metadata = try fillMetadata("t", &full, &storage);
-    try std.testing.expectEqual(@as(usize, max_headers + 1), metadata.len);
+    try testing.expectEqual(@as(usize, max_headers + 1), metadata.len);
 
     const over: [max_headers + 1]Header = @splat(.{ .name = "x", .value = "v" });
-    try std.testing.expectError(
+    try testing.expectError(
         error.TooManyHeaders,
         fillMetadata("t", &over, &storage),
     );
 }
 
 test "decodeReply: a status message is copied into the reply arena" {
-    const gpa = std.testing.allocator;
+    const gpa = testing.allocator;
 
     var encoded: Io.Writer.Allocating = .init(gpa);
     defer encoded.deinit();
@@ -514,13 +515,13 @@ test "decodeReply: a status message is copied into the reply arena" {
     defer reply.deinit();
     @memset(&status_text_buf, 'x');
 
-    try std.testing.expect(reply.ok());
-    try std.testing.expectEqualStrings("deadline exceeded", reply.status.message);
-    try std.testing.expectEqual(@as(i64, 42), reply.value.?.header.?.revision);
+    try testing.expect(reply.ok());
+    try testing.expectEqualStrings("deadline exceeded", reply.status.message);
+    try testing.expectEqual(@as(i64, 42), reply.value.?.header.?.revision);
 }
 
 test "decodeReply: an error status keeps the status when the body does not decode" {
-    const gpa = std.testing.allocator;
+    const gpa = testing.allocator;
     var body = "not a protobuf message".*;
 
     var reply = try decodeReply(etcdserverpb.PutResponse, gpa, .{
@@ -529,7 +530,7 @@ test "decodeReply: an error status keeps the status when the body does not decod
     });
     defer reply.deinit();
 
-    try std.testing.expect(!reply.ok());
-    try std.testing.expectEqual(grpc.status.Code.unavailable, reply.status.code);
-    try std.testing.expect(reply.value == null);
+    try testing.expect(!reply.ok());
+    try testing.expectEqual(grpc.status.Code.unavailable, reply.status.code);
+    try testing.expect(reply.value == null);
 }

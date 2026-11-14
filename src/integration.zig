@@ -5,9 +5,10 @@
 //! connection, so one test cannot leave the next one a poisoned session.
 
 const std = @import("std");
-const expect = std.testing.expect;
-const expectEqual = std.testing.expectEqual;
-const expectEqualStrings = std.testing.expectEqualStrings;
+const testing = std.testing;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const expectEqualStrings = testing.expectEqualStrings;
 
 const config = @import("config");
 const etcd = @import("etcd");
@@ -16,7 +17,7 @@ const etcd = @import("etcd");
 /// caller must initialize it where it lives. A helper returns it by value at
 /// its peril.
 fn connect(client: *etcd.Client) !void {
-    try client.init(std.testing.allocator, std.testing.io, config.endpoint, .{});
+    try client.init(testing.allocator, testing.io, config.endpoint, .{});
 }
 
 test "integration: put, range, and delete" {
@@ -82,13 +83,13 @@ test "integration: lease grant, attach, and revoke" {
 }
 
 test "integration: watch delivers put and delete events" {
-    const gpa = std.testing.allocator;
+    const gpa = testing.allocator;
 
     var client: etcd.Client = undefined;
     try connect(&client);
     defer client.deinit();
 
-    var watcher = try etcd.Watcher.init(gpa, std.testing.io, config.endpoint, .{
+    var watcher = try etcd.Watcher.init(gpa, testing.io, config.endpoint, .{
         .target = .{ .prefix = "integration/watch/" },
     });
     defer watcher.deinit();
@@ -168,9 +169,9 @@ test "integration: authenticate against a disabled server" {
 test "integration: authenticate and call with a token" {
     if (config.auth_endpoint.len == 0) return error.SkipZigTest;
 
-    const gpa = std.testing.allocator;
+    const gpa = testing.allocator;
     var client: etcd.Client = undefined;
-    try client.init(gpa, std.testing.io, config.auth_endpoint, .{});
+    try client.init(gpa, testing.io, config.auth_endpoint, .{});
     defer client.deinit();
 
     {

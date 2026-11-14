@@ -7,6 +7,8 @@
 //! code generation is involved.
 
 const std = @import("std");
+const testing = std.testing;
+const Io = std.Io;
 
 const pb = @import("protobuf");
 
@@ -49,17 +51,17 @@ test "PutRequest keeps etcd's field numbers" {
     };
 
     var buffer: [64]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
+    var writer: Io.Writer = .fixed(&buffer);
     try pb.encode(etcdserverpb.PutRequest, request, .{}, &writer);
 
-    var reader: std.Io.Reader = .fixed(writer.buffered());
-    var parsed = try pb.decode(etcdserverpb.PutRequest, std.testing.allocator, &reader, .{});
+    var reader: Io.Reader = .fixed(writer.buffered());
+    var parsed = try pb.decode(etcdserverpb.PutRequest, testing.allocator, &reader, .{});
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("hello", parsed.value.key);
-    try std.testing.expectEqualStrings("world", parsed.value.value);
-    try std.testing.expectEqual(@as(i64, 7), parsed.value.lease);
-    try std.testing.expect(parsed.value.prev_kv);
+    try testing.expectEqualStrings("hello", parsed.value.key);
+    try testing.expectEqualStrings("world", parsed.value.value);
+    try testing.expectEqual(@as(i64, 7), parsed.value.lease);
+    try testing.expect(parsed.value.prev_kv);
 }
 
 test "WatchResponse decodes repeated events" {
@@ -73,21 +75,21 @@ test "WatchResponse decodes repeated events" {
     };
 
     var buffer: [256]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
+    var writer: Io.Writer = .fixed(&buffer);
     try pb.encode(etcdserverpb.WatchResponse, response, .{}, &writer);
 
-    var reader: std.Io.Reader = .fixed(writer.buffered());
+    var reader: Io.Reader = .fixed(writer.buffered());
     var parsed = try pb.decode(
         etcdserverpb.WatchResponse,
-        std.testing.allocator,
+        testing.allocator,
         &reader,
         .{},
     );
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(i64, 99), parsed.value.header.?.revision);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.events.len);
-    try std.testing.expectEqual(mvccpb.Event.Type.put, parsed.value.events[0].type);
-    try std.testing.expectEqualStrings("a", parsed.value.events[0].kv.key);
-    try std.testing.expectEqual(mvccpb.Event.Type.delete, parsed.value.events[1].type);
+    try testing.expectEqual(@as(i64, 99), parsed.value.header.?.revision);
+    try testing.expectEqual(@as(usize, 2), parsed.value.events.len);
+    try testing.expectEqual(mvccpb.Event.Type.put, parsed.value.events[0].type);
+    try testing.expectEqualStrings("a", parsed.value.events[0].kv.key);
+    try testing.expectEqual(mvccpb.Event.Type.delete, parsed.value.events[1].type);
 }

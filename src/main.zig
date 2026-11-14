@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
         print("  {s} = {s}\n", .{ kv.key, kv.value });
     }
 
-    var watcher = try etcd.Watcher.init(init.gpa, io, endpoint, .{
+    var watcher: etcd.Watcher = try .init(init.gpa, io, endpoint, .{
         .target = .{ .prefix = prefix },
     });
     defer watcher.deinit();
