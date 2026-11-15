@@ -210,3 +210,50 @@ test "integration: authenticate and call with a token" {
         try expect(etcd.auth.needsReauth(rejected.status.message));
     }
 }
+
+test "integration: stop unblocks an idle watch" {
+    var watcher = try etcd.Watcher.init(testing.allocator, testing.io, config.endpoint, .{
+        .target = .{ .prefix = "integration/stop/" },
+    });
+    defer watcher.deinit();
+
+    const first = try watcher.nextEvent();
+    switch (first) {
+        .response => |response| {
+            var parsed = response;
+            parsed.deinit();
+        },
+        else => return error.WatchNotEstablished,
+    }
+
+    const Stopper = struct {
+        fn run(w: *etcd.Watcher) void {
+            var threaded: std.Io.Threaded = .init_single_threaded;
+            defer threaded.deinit();
+            const io = threaded.io();
+            io.sleep(.fromNanoseconds(100 * std.time.ns_per_ms), .awake) catch {};
+            w.stop(io);
+        }
+    };
+    const stopper = try std.Thread.spawn(.{}, Stopper.run, .{&watcher});
+
+    // A response may already be queued when stop() fires. Drain it and
+    // require the next call to observe the stop.
+    var stopped = false;
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        switch (try watcher.nextEvent()) {
+            .response => |response| {
+                var parsed = response;
+                parsed.deinit();
+            },
+            .reconnecting => |err| return err,
+            .stopped => {
+                stopped = true;
+                break;
+            },
+        }
+    }
+    stopper.join();
+    try expect(stopped);
+}

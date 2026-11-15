@@ -34,7 +34,14 @@ const Session = struct {
 const Next = union(enum) {
     response: pb.Parsed(etcdserverpb.WatchResponse),
     closed,
-    canceled,
+};
+
+pub const Event = union(enum) {
+    response: pb.Parsed(etcdserverpb.WatchResponse),
+    /// A transport failure or a clean stream end. The caller decides when
+    /// to retry; the connection is already torn down.
+    reconnecting: anyerror,
+    stopped,
 };
 
 pub const Options = struct {
@@ -99,6 +106,9 @@ pub const Watcher = struct {
     last_revision: i64,
     session: ?*Session = null,
     stream: ?grpc.Stream = null,
+    stopped: std.atomic.Value(bool) = .init(false),
+    /// Serializes the session pointer between the watch thread and stop().
+    session_lock: Io.Mutex = .init,
 
     pub fn init(
         gpa: Allocator,
@@ -160,33 +170,75 @@ pub const Watcher = struct {
     /// (out of memory, bad credentials) returns an error.
     pub fn next(self: *Watcher) !?pb.Parsed(etcdserverpb.WatchResponse) {
         while (true) {
-            if (self.stream == null) {
-                self.establish() catch |err| {
-                    if (isFatal(err)) return err;
-                    log.warn("watch connect failed: {s}; retrying", .{@errorName(err)});
-                    self.teardown();
+            switch (try self.nextEvent()) {
+                .response => |response| {
+                    if (response.value.canceled) {
+                        log.info("watch canceled at compact revision {d}: {s}", .{
+                            response.value.compact_revision,
+                            response.value.cancel_reason,
+                        });
+                        var canceled = response;
+                        canceled.deinit();
+                        self.teardown();
+                        return null;
+                    }
+                    return response;
+                },
+                .reconnecting => |err| {
+                    log.warn("watch transport ended: {s}; retrying", .{@errorName(err)});
                     self.sleepRetry();
-                    continue;
-                };
+                },
+                .stopped => return error.Stopped,
             }
+        }
+    }
 
-            const outcome = self.read() catch |err| {
-                log.warn("watch read failed: {s}; reconnecting", .{@errorName(err)});
+    /// The next watch event. Unlike `next`, a transport failure returns
+    /// `.reconnecting` without sleeping; the caller owns the retry policy.
+    /// A server-side cancel is returned as a response with `canceled` set so
+    /// the caller can read `compact_revision` and `cancel_reason`.
+    pub fn nextEvent(self: *Watcher) !Event {
+        if (self.stopped.load(.acquire)) return .stopped;
+
+        if (self.stream == null) {
+            self.establish() catch |err| {
+                if (self.stopped.load(.acquire)) return .stopped;
+                if (isFatal(err)) return err;
                 self.teardown();
-                self.sleepRetry();
-                continue;
+                return .{ .reconnecting = err };
             };
+            if (self.stopped.load(.acquire)) {
+                self.teardown();
+                return .stopped;
+            }
+        }
 
-            switch (outcome) {
-                .response => |response| return response,
-                .closed => {
-                    self.teardown();
-                    self.sleepRetry();
-                },
-                .canceled => {
-                    self.teardown();
-                    return null;
-                },
+        const outcome = self.read() catch |err| {
+            if (self.stopped.load(.acquire)) return .stopped;
+            self.teardown();
+            return .{ .reconnecting = err };
+        };
+
+        return switch (outcome) {
+            .response => |response| .{ .response = response },
+            .closed => blk: {
+                self.teardown();
+                if (self.stopped.load(.acquire)) break :blk .stopped;
+                break :blk .{ .reconnecting = error.StreamClosed };
+            },
+        };
+    }
+
+    /// Stop the watcher. Sets a flag and shuts the open socket down so a
+    /// blocked read returns. The watch thread observes the flag and returns
+    /// `.stopped` from `nextEvent`.
+    pub fn stop(self: *Watcher, io: Io) void {
+        self.stopped.store(true, .release);
+        self.session_lock.lockUncancelable(io);
+        defer self.session_lock.unlock(io);
+        if (self.session) |session| {
+            if (session.client.transport.socket) |*socket| {
+                socket.shutdown(io, .both) catch {};
             }
         }
     }
@@ -218,7 +270,7 @@ pub const Watcher = struct {
         while (true) {
             if (try stream.nextMessage()) |message| {
                 var reader: Io.Reader = .fixed(message.bytes);
-                var parsed = pb.decode(
+                const parsed = pb.decode(
                     etcdserverpb.WatchResponse,
                     self.gpa,
                     &reader,
@@ -229,14 +281,6 @@ pub const Watcher = struct {
                 };
 
                 self.observe(parsed.value);
-                if (parsed.value.canceled) {
-                    log.info("watch canceled at compact revision {d}: {s}", .{
-                        parsed.value.compact_revision,
-                        parsed.value.cancel_reason,
-                    });
-                    parsed.deinit();
-                    return .canceled;
-                }
                 return .{ .response = parsed };
             }
 
@@ -286,8 +330,10 @@ pub const Watcher = struct {
         var stream = session.client.stream(&session.calls[0], session.calls[0..]);
         try self.sendCreate(&stream);
 
+        self.session_lock.lockUncancelable(self.io);
         self.session = session;
         self.stream = stream;
+        self.session_lock.unlock(self.io);
         log.info("watch established from revision {d}", .{self.lastRevision()});
     }
 
@@ -321,11 +367,17 @@ pub const Watcher = struct {
     }
 
     fn observe(self: *Watcher, response: etcdserverpb.WatchResponse) void {
+        // The create confirmation carries the store's current revision and
+        // no events. Adopting it would resume past events that were never
+        // delivered. Progress notifications are safe to adopt.
+        if (response.created) return;
         const header = response.header orelse return;
         if (header.revision > self.last_revision) self.last_revision = header.revision;
     }
 
     fn teardown(self: *Watcher) void {
+        self.session_lock.lockUncancelable(self.io);
+        defer self.session_lock.unlock(self.io);
         if (self.stream) |*stream| {
             stream.deinit();
             self.stream = null;
@@ -352,6 +404,15 @@ fn isFatal(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "observe ignores the create response revision" {
+    var watcher: Watcher = undefined;
+    watcher.last_revision = 7;
+    watcher.observe(.{ .created = true, .header = .{ .revision = 100 } });
+    try std.testing.expectEqual(@as(i64, 7), watcher.last_revision);
+    watcher.observe(.{ .created = false, .header = .{ .revision = 8 } });
+    try std.testing.expectEqual(@as(i64, 8), watcher.last_revision);
 }
 
 test "Watcher owns a copy of its target" {
