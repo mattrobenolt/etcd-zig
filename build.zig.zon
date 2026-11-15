@@ -4,11 +4,10 @@
     .fingerprint = 0x7a4b85841e7ef1bd, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // gRPC framing, status, and calls over HTTP/2. Pinned to the commit
-        // this rewrite was written against, because the package is untagged.
+        // gRPC framing, status, and calls over HTTP/2, at the v0.1.1 release.
         .grpc = .{
-            .url = "git+https://github.com/baskingspot/grpc#a3f8b59b66d565a81b189e8712e3f0f3bf646937",
-            .hash = "grpc-0.1.0-t3Pkt4etBAC65wxgPTnXmH4ehyzTZQbXe2vcSpA5LUID",
+            .url = "https://baskingspot.dev/grpc/v0.1.1.tar.gz",
+            .hash = "grpc-0.1.1-t3Pkt1utBACzQ4T0BbHP_6Dt0fYF1CGIaBR8996leCc6",
         },
         // The typed message codec. Pinned past v0.2.0: the etcd Watch
         // request is a oneof, and the tag does not carry oneof support.
