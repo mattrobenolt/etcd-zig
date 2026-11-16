@@ -276,8 +276,12 @@ pub const Watcher = struct {
                     &reader,
                     .{},
                 ) catch |err| {
-                    log.warn("watch decode failed: {s}; skipping message", .{@errorName(err)});
-                    continue;
+                    // Do not skip a frame: later frames would advance the
+                    // resume revision past its events. Tear the stream down so
+                    // `nextEvent` reports `.reconnecting` and the caller
+                    // replays from the last applied revision.
+                    log.warn("watch decode failed: {s}; reconnecting", .{@errorName(err)});
+                    return err;
                 };
 
                 self.observe(parsed.value);
