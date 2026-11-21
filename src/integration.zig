@@ -257,3 +257,40 @@ test "integration: stop unblocks an idle watch" {
     stopper.join();
     try expect(stopped);
 }
+
+test "integration: quiet watch receives client-driven progress probes" {
+    var watcher = try etcd.Watcher.init(testing.allocator, testing.io, config.endpoint, .{
+        .target = .{ .prefix = "integration/progress-probe/" },
+        .progress_interval = try .init(try .fromMilliseconds(150)),
+        .progress_timeout = .fromSecondsComptime(2),
+    });
+    defer watcher.deinit();
+
+    switch (try watcher.nextEvent()) {
+        .response => |response| {
+            var parsed = response;
+            defer parsed.deinit();
+            try expect(parsed.value.created);
+        },
+        else => return error.WatchNotEstablished,
+    }
+
+    // No keys are written under this prefix and etcd uses its default 10m
+    // progress interval, so these progress responses come from Watcher's
+    // client-driven WatchProgressRequest.
+    var progress_seen: usize = 0;
+    while (progress_seen < 2) : (progress_seen += 1) {
+        switch (try watcher.nextEvent()) {
+            .response => |response| {
+                var parsed = response;
+                defer parsed.deinit();
+                try expect(!parsed.value.created);
+                try expectEqual(@as(usize, 0), parsed.value.events.len);
+                try expect(parsed.value.header != null);
+                try expect(parsed.value.header.?.revision > 0);
+            },
+            .reconnecting => |err| return err,
+            .stopped => return error.UnexpectedStop,
+        }
+    }
+}

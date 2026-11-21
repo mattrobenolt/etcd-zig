@@ -20,8 +20,12 @@ const pb = @import("protobuf");
 const time = @import("stdx").time;
 
 const auth = @import("auth.zig");
-const Endpoint = @import("endpoint.zig").Endpoint;
+const endpoint_mod = @import("endpoint.zig");
+const Endpoint = endpoint_mod.Endpoint;
 const etcdserverpb = @import("etcdserverpb.zig");
+
+pub const KeepAlive = grpc.KeepAlive;
+pub const TcpKeepAlive = endpoint_mod.KeepAlive;
 
 const log = std.log.scoped(.etcd);
 
@@ -53,6 +57,11 @@ pub const Options = struct {
     /// The space one unary response may use, for the message and the status
     /// text. Four MiB matches gRPC's default receive limit.
     reply_capacity: usize = 4 * 1024 * 1024,
+    /// TCP keepalive policy applied when dialing the endpoint. Null disables it.
+    tcp_keepalive: ?TcpKeepAlive = .default,
+    /// HTTP/2 PING keepalive policy. Disabled by default on unary clients;
+    /// `Watcher` enables it by default.
+    keepalive: KeepAlive = .{},
 };
 
 /// A unary reply: the gRPC status, the decoded message when one arrived, and
@@ -122,11 +131,15 @@ pub const Client = struct {
         const reply_buffer = try gpa.alloc(u8, options.reply_capacity);
         errdefer gpa.free(reply_buffer);
 
-        const socket = try parsed.connect(io);
+        const socket = try parsed.connectWithKeepAlive(io, options.tcp_keepalive);
         self.transport.init(gpa, io, socket) catch |err| {
             socket.close(io);
             return err;
         };
+        errdefer self.transport.deinit();
+        if (options.keepalive.idle_time.get() != null) {
+            try self.transport.setKeepAlive(options.keepalive);
+        }
 
         self.endpoint = endpoint_copy;
         self.reply_buffer = reply_buffer;

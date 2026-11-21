@@ -2,11 +2,63 @@
 //! taking the direct path and a hostname going through the resolver.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const math = std.math;
 const mem = std.mem;
 const testing = std.testing;
 
 const posix = @import("stdx").posix;
+
+/// TCP keepalive policy applied to dialed etcd sockets so a silently vanished
+/// peer (for example, a killed host without FIN/RST) fails the socket instead
+/// of leaving a blocking watch read hung forever.
+pub const KeepAlive = struct {
+    idle_sec: u32 = 5,
+    interval_sec: u32 = 1,
+    count: u32 = 3,
+
+    pub const default: KeepAlive = .{};
+
+    pub fn validate(self: KeepAlive) error{InvalidTcpKeepAlive}!void {
+        if (self.idle_sec == 0 or self.idle_sec > math.maxInt(i32)) {
+            return error.InvalidTcpKeepAlive;
+        }
+        if (self.interval_sec == 0 or self.interval_sec > math.maxInt(i32)) {
+            return error.InvalidTcpKeepAlive;
+        }
+        if (self.count == 0 or self.count > math.maxInt(i32)) {
+            return error.InvalidTcpKeepAlive;
+        }
+    }
+
+    pub fn apply(self: KeepAlive, fd: std.posix.fd_t) !void {
+        try self.validate();
+        try posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, 1);
+        const idle_opt = if (builtin.os.tag == .macos)
+            std.posix.TCP.KEEPALIVE
+        else
+            std.posix.TCP.KEEPIDLE;
+        try posix.setsockopt(
+            fd,
+            std.posix.IPPROTO.TCP,
+            idle_opt,
+            @as(i32, @intCast(self.idle_sec)),
+        );
+        try posix.setsockopt(
+            fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.KEEPINTVL,
+            @as(i32, @intCast(self.interval_sec)),
+        );
+        try posix.setsockopt(
+            fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.KEEPCNT,
+            @as(i32, @intCast(self.count)),
+        );
+    }
+};
 
 pub const Endpoint = struct {
     host: []const u8,
@@ -57,10 +109,21 @@ pub const Endpoint = struct {
         return text;
     }
 
-    /// Dial the endpoint. A literal address skips the resolver. The socket
-    /// gets TCP_NODELAY: a gRPC call writes its head and body as separate
-    /// small frames, and Nagle would hold the second one for a delayed ACK.
+    /// Dial the endpoint with the default TCP keepalive policy. A literal
+    /// address skips the resolver. The socket gets TCP_NODELAY: a gRPC call
+    /// writes its head and body as separate small frames, and Nagle would hold
+    /// the second one for a delayed ACK.
     pub fn connect(self: Endpoint, io: Io) !Io.net.Stream {
+        return self.connectWithKeepAlive(io, .default);
+    }
+
+    /// Dial the endpoint with an explicit TCP keepalive policy, or null to
+    /// leave keepalive off.
+    pub fn connectWithKeepAlive(
+        self: Endpoint,
+        io: Io,
+        keepalive: ?KeepAlive,
+    ) !Io.net.Stream {
         const stream = if (Io.net.IpAddress.parseLiteral(self.authority)) |address|
             try address.connect(io, .{ .mode = .stream })
         else |_| blk: {
@@ -75,6 +138,7 @@ pub const Endpoint = struct {
             std.posix.TCP.NODELAY,
             1,
         );
+        if (keepalive) |ka| try ka.apply(stream.socket.handle);
         return stream;
     }
 };
@@ -128,4 +192,40 @@ test "connect sets TCP_NODELAY" {
         std.posix.TCP.NODELAY,
     );
     try testing.expect(value != 0);
+    const keepalive = try posix.getsockopt(
+        stream.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.KEEPALIVE,
+    );
+    try testing.expect(keepalive != 0);
+    const idle_opt = if (builtin.os.tag == .macos)
+        std.posix.TCP.KEEPALIVE
+    else
+        std.posix.TCP.KEEPIDLE;
+    try testing.expectEqual(@as(i32, KeepAlive.default.idle_sec), try posix.getsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        idle_opt,
+    ));
+    try testing.expectEqual(@as(i32, KeepAlive.default.interval_sec), try posix.getsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.KEEPINTVL,
+    ));
+    try testing.expectEqual(@as(i32, KeepAlive.default.count), try posix.getsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.KEEPCNT,
+    ));
+}
+
+test "KeepAlive.validate rejects zero and out-of-range values" {
+    try KeepAlive.default.validate();
+    try testing.expectError(error.InvalidTcpKeepAlive, (KeepAlive{ .idle_sec = 0 }).validate());
+    try testing.expectError(error.InvalidTcpKeepAlive, (KeepAlive{ .interval_sec = 0 }).validate());
+    try testing.expectError(error.InvalidTcpKeepAlive, (KeepAlive{ .count = 0 }).validate());
+    try testing.expectError(
+        error.InvalidTcpKeepAlive,
+        (KeepAlive{ .idle_sec = math.maxInt(u32) }).validate(),
+    );
 }

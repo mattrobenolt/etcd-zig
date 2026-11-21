@@ -4,10 +4,10 @@
     .fingerprint = 0x7a4b85841e7ef1bd, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // gRPC framing, status, and calls over HTTP/2, at the v0.1.1 release.
+        // gRPC framing, status, and calls over HTTP/2, at the v0.3.0 release.
         .grpc = .{
-            .url = "https://baskingspot.dev/grpc/v0.1.1.tar.gz",
-            .hash = "grpc-0.1.1-t3Pkt1utBACzQ4T0BbHP_6Dt0fYF1CGIaBR8996leCc6",
+            .url = "https://baskingspot.dev/grpc/v0.3.0.tar.gz",
+            .hash = "grpc-0.3.0-t3Pkt2mbBQBNBjMA9hkcIYao_cbGDaFvv83BXlv9uom7",
         },
         // The typed message codec. Pinned past v0.2.0: the etcd Watch
         // request is a oneof, and the tag does not carry oneof support.
@@ -17,8 +17,8 @@
         },
         // Deadlines, durations, and the compact time values gRPC carries.
         .stdx = .{
-            .url = "https://baskingspot.dev/stdx/v0.5.0.tar.gz",
-            .hash = "stdx-0.5.0-CcWegogqEQAvbEzD5F1r02a42hPX7GV82njuREakeC3a",
+            .url = "https://baskingspot.dev/stdx/v0.6.0.tar.gz",
+            .hash = "stdx-0.6.0-CcWegpsXEQBPvqhuSRRDiRjq08s5gXavvTuvoL-Bo3BE",
         },
         // The plain-text test runner. Lazy: a consumer never fetches it.
         .testingx = .{
