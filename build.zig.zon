@@ -1,6 +1,6 @@
 .{
     .name = .etcd,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x7a4b85841e7ef1bd, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
