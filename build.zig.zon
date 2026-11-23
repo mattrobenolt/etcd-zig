@@ -1,13 +1,13 @@
 .{
     .name = .etcd,
-    .version = "0.1.1",
+    .version = "0.1.2",
     .fingerprint = 0x7a4b85841e7ef1bd, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // gRPC framing, status, and calls over HTTP/2, at the v0.3.1 release.
         .grpc = .{
-            .url = "https://baskingspot.dev/grpc/v0.3.1.tar.gz",
-            .hash = "grpc-0.3.1-t3Pkt6ybBQA_a3Ib-oPbF2I3LoUmuPeWQaKPnk2wtFEe",
+            .url = "https://baskingspot.dev/grpc/v0.3.3.tar.gz",
+            .hash = "grpc-0.3.3-t3Pkty6bBQCPISm17MxWIdj2fGbl092l4GsGRP1Kwtml",
         },
         // The typed message codec. Pinned past v0.2.0: the etcd Watch
         // request is a oneof, and the tag does not carry oneof support.
