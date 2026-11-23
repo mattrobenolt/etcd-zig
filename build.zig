@@ -4,7 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const grpc_dep = b.dependency("grpc", .{ .target = target, .optimize = optimize });
+    // A consumer that enables http's TLS lane asks `b.dependency("http", ...)`
+    // for it directly. Zig builds a second http instance when grpc asks with a
+    // different option set, and both instances are rooted at http's
+    // `src/root.zig`, which one compilation cannot hold twice. Forward the flag
+    // the way grpc forwards it to http, so the consumer can put both requests
+    // on the same side.
+    const expose_tls = b.option(bool, "tls", "Forward the TLS lane to grpc") orelse false;
+    const grpc_dep = b.dependency("grpc", .{
+        .target = target,
+        .optimize = optimize,
+        .tls = expose_tls,
+    });
     const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
     const stdx_dep = b.dependency("stdx", .{ .target = target, .optimize = optimize });
 
